@@ -1,7 +1,7 @@
 #![feature(int_roundings)]
 
 mod structs;
-use crate::structs::{BlockGroupDescriptor, DirectoryEntry, Inode, Superblock};
+use crate::structs::{BlockGroupDescriptor, DirectoryEntry, Inode, Superblock, TypePerm};
 use std::mem;
 use null_terminated::NulStr;
 use uuid::Uuid;
@@ -178,7 +178,7 @@ fn main() -> Result<()> {
                 // `cd dir_name` moves cwd to that directory
                 let elts: Vec<&str> = line.split(' ').collect();
                 if elts.len() == 1 {
-                    current_working_inode = 2;
+     				current_working_inode = 2;
                 } else {
                     // TODO: if the argument is a path, follow the path
                     // e.g., cd dir_1/dir_2 should move you down 2 directories
@@ -186,10 +186,14 @@ fn main() -> Result<()> {
                     let to_dir = elts[1];
                     let mut found = false;
                     for dir in &dirs {
-                        if dir.1.to_string().eq(to_dir) {
-                            // TODO: maybe don't just assume this is a directory
-                            found = true;
-                            current_working_inode = dir.0;
+                        if dir.1.to_string().eq(to_dir){
+							found = true;
+							let new_inode = ext2.get_inode(dir.0);
+							if new_inode.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
+	                            current_working_inode = dir.0;
+                            } else {
+								println!("unable to cd into a directoy");
+							}
                         }
                     }
                     if !found {
