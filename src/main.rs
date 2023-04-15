@@ -109,24 +109,70 @@ impl Ext2 {
         // println!("{:?}", inode_table);
         &inode_table[index]
     }
+    
+    pub fn add_dir(&self,)
 
     pub fn read_dir_inode(&self, inode: usize) -> std::io::Result<Vec<(usize, &NulStr)>> {
         let mut ret = Vec::new();
         let root = self.get_inode(inode);
         // println!("in read_dir_inode, #{} : {:?}", inode, root);
         // println!("following direct pointer to data block: {}", root.direct_pointer[0]);
-        let entry_ptr = self.blocks[root.direct_pointer[0] as usize - self.block_offset].as_ptr();
-        let mut byte_offset: isize = 0;
-        while byte_offset < root.size_low as isize { // <- todo, support large directories
-            let directory = unsafe { 
-                &*(entry_ptr.offset(byte_offset) as *const DirectoryEntry) 
-            };
-            // println!("{:?}", directory);
-            byte_offset += directory.entry_size as isize;
-            ret.push((directory.inode as usize, &directory.name));
-        } 
+        let dir_size = root.size_low;
+		let blocks = root.get_all_blocks(&self);
+        let mut blocks_read = 0;
+        for block in blocks {
+			//println!("readng block {} of the directory", blocks_read);
+			let entry_ptr = self.blocks[block as usize - self.block_offset].as_ptr();
+		    let mut byte_offset: isize = 0;
+	        while byte_offset < self.block_size.try_into().unwrap() && (blocks_read*self.block_size) as isize + byte_offset < dir_size as isize { // <- todo, support large directories
+	            let directory = unsafe { 
+		        	&*(entry_ptr.offset(byte_offset) as *const DirectoryEntry) 
+		    	};
+		        // println!("{:?}", directory);
+		        byte_offset += directory.entry_size as isize;
+	            ret.push((directory.inode as usize, &directory.name));
+		    }
+		    blocks_read += 1;
+        }
         Ok(ret)
     }
+    
+    pub fn read_ptr_block(&self, block: u32) -> Vec<u32> {
+		if (block as usize) < self.block_offset {return Vec::new();}
+		let mut blocks = Vec::new();
+		let entry_ptr = self.blocks[block as usize - self.block_offset].as_ptr();
+		let mut byte_offset: isize = 0;
+		while byte_offset < self.block_size as isize {
+			let ptr = unsafe { 
+	        	&*(entry_ptr.offset(byte_offset) as *const u32) 
+	    	};
+	    	if (*ptr as usize) > self.block_offset {
+				blocks.push(*ptr);
+			}
+			byte_offset += 4;
+		}
+		blocks
+	}
+	
+	pub fn read_double_ptr_block(&self, block: u32) -> Vec<u32>{
+		if (block as usize) < self.block_offset {return Vec::new();}
+		let more_blocks = self.read_ptr_block(block);
+		let mut all_blocks = Vec::new();
+		for indirect in more_blocks {
+			all_blocks.append(&mut self.read_ptr_block(indirect));
+		}
+		all_blocks
+	}
+	
+	pub fn read_triple_ptr_block(&self, block: u32) -> Vec<u32>{
+		if (block as usize) < self.block_offset {return Vec::new();}
+		let more_blocks = self.read_double_ptr_block(block);
+		let mut all_blocks = Vec::new();
+		for indirect in more_blocks {
+			all_blocks.append(&mut self.read_ptr_block(indirect));
+		}
+		all_blocks
+	}
 }
 
 impl fmt::Debug for Inode<> {
@@ -144,8 +190,43 @@ impl fmt::Debug for Inode<> {
     }
 }
 
+impl Inode {
+	pub fn get_all_blocks(&self, ext2: &Ext2) -> Vec<u32> {
+		let file_size;
+		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
+			file_size = self.size_low as u64;
+		} else {
+			file_size = (self.size_low as u64) + (self.size_high as u64)<<32;
+		}
+		let mut blocks = Vec::new();
+		for ptr in self.direct_pointer{
+			if ptr as usize > ext2.block_offset && blocks.len()*ext2.block_size < file_size as usize {
+				blocks.push(ptr);
+			}
+		}
+		for block in ext2.read_ptr_block(self.indirect_pointer){
+			if blocks.len()*ext2.block_size < file_size as usize {
+				blocks.push(block);
+			}
+		}
+		for block in ext2.read_double_ptr_block(self.doubly_indirect){
+			if blocks.len()*ext2.block_size < file_size as usize {
+				blocks.push(block);
+			}
+		}
+		for block in ext2.read_triple_ptr_block(self.triply_indirect){
+			if blocks.len()*ext2.block_size < file_size as usize {
+				blocks.push(block);
+			}
+		}
+		
+		blocks
+	}
+	
+}
+
 fn main() -> Result<()> {
-    let disk = include_bytes!("../myfs.ext2");
+    let disk = include_bytes!("../myfsplusbeemovie.ext2");
     let start_addr: usize = disk.as_ptr() as usize;
     let ext2 = Ext2::new(&disk[..], start_addr);
 
@@ -192,7 +273,7 @@ fn main() -> Result<()> {
 							if new_inode.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
 	                            current_working_inode = dir.0;
                             } else {
-								println!("unable to cd into a directoy");
+								println!("can only cd into a directory");
 							}
                         }
                     }
@@ -204,12 +285,51 @@ fn main() -> Result<()> {
                 // `mkdir childname`
                 // create a directory with the given name, add a link to cwd
                 // consider supporting `-p path/to_file` to create a path of directories
+                let elts: Vec<&str> = line.split(' ').collect();
                 println!("mkdir not yet implemented");
             } else if line.starts_with("cat") {
                 // `cat filename`
                 // print the contents of filename to stdout
                 // if it's a directory, print a nice error
-                println!("cat not yet implemented");
+                let elts: Vec<&str> = line.split(' ').collect();
+                if elts.len() == 1 {
+     				println!("must supply an argument to cat")
+                } else {
+                    let filename = elts[1];
+                    let mut found = false;
+                    for file in &dirs {
+                        if file.1.to_string().eq(filename){
+							found = true;
+							let file_inode = ext2.get_inode(file.0);
+							if file_inode.type_perm & TypePerm::FILE == TypePerm::FILE {
+								let file_size = (file_inode.size_low as u64) + (file_inode.size_high as u64)<<32;
+								let blocks = file_inode.get_all_blocks(&ext2);
+								let mut size_left = file_size as usize;
+	                            for block_ptr in blocks {
+									if size_left > 0 {
+										let block_index = block_ptr as usize - ext2.block_offset;
+										let contents = match std::str::from_utf8(ext2.blocks[block_index]){
+											Ok(s) => s,
+											Err(_) => "bad file",
+										};
+										if size_left < ext2.block_size {
+											print!("{}", contents.split_at(size_left).0);
+											size_left = 0;
+										} else{
+											print!("{}", contents);
+											size_left -= contents.len();
+										}
+									}
+								}
+                            } else {
+								println!("unable to cat, {} is not a file", filename);
+							}
+                        }
+                    }
+                    if !found {
+                        println!("unable to locate {}", filename);
+                    }
+                }
             } else if line.starts_with("rm") {
                 // `rm target`
                 // unlink a file or empty directory
