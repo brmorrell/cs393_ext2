@@ -1,8 +1,10 @@
 use bitflags::bitflags;
 use null_terminated::NulStr;
+use zerocopy::AsBytes;
 
 #[repr(C)]
 #[derive(Debug)]
+#[derive(AsBytes)]
 // https://wiki.osdev.org/Ext2
 pub struct Superblock {
     // taken from https://wiki.osdev.org/Ext2
@@ -109,6 +111,7 @@ pub struct Superblock {
 
 #[repr(C)]
 #[derive(Debug)]
+#[derive(AsBytes)]
 pub struct BlockGroupDescriptor {
     /// Block address of block usage bitmap
     pub block_usage_addr: u32,

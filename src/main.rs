@@ -5,9 +5,11 @@ use crate::structs::{BlockGroupDescriptor, DirectoryEntry, Inode, Superblock, Ty
 use std::mem;
 use null_terminated::NulStr;
 use uuid::Uuid;
-use zerocopy::ByteSliceMut;
+use zerocopy::{ByteSliceMut, AsBytes};
 use std::fmt;
 use rustyline::{DefaultEditor, Result};
+use std::fs::File;
+use std::io::Write;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -66,7 +68,7 @@ impl Ext2 {
 
         println!("block group 0: {:?}", block_groups[0]);
 
-        let blocks  = unsafe {
+        let mut blocks  = unsafe {
             std::slice::from_raw_parts_mut(
                 block_groups_rest_bytes.1.as_ptr() as *mut u8,
                 // would rather use: device_bytes.as_ptr(),
@@ -78,6 +80,7 @@ impl Ext2 {
 
         let offset_bytes = (blocks[0].as_ptr() as usize) - start_addr;
         let block_offset = offset_bytes / block_size;
+        blocks.truncate(blocks.len() - block_offset);
         let uuid = Uuid::from_bytes(superblock.fs_id);
         Ext2 {
             superblock,
@@ -949,6 +952,7 @@ fn main() -> Result<()> {
             } else if line.starts_with("mv") {
                 // `mv filename target`
                 // copies filename to target file
+                //TODO: this
                 println!("mv not yet implemented");
             } else if line.starts_with("import") {
                 // `import host_file target_name`
@@ -962,9 +966,37 @@ fn main() -> Result<()> {
                 println!("export not yet implemented");
             } else if line.starts_with("unmount") {
                 // `unmount`
-                // quits the filesystem and writes changes out to the device
-                //TODO: this
-                println!("export not yet implemented");
+                // quits the filesystem and writes changes out to the device (file)
+                //TODO: should this wait until every block is done to actually write them, somehow?
+                let mut device_out = File::create("./myfsplusbeemovie2.ext2")?;
+                let boot_block = disk.split_at(EXT2_START_OF_SUPERBLOCK).0;
+                if let Err(e) = device_out.write_all(boot_block) {
+						println!("write failed on boot block with error {}", e);
+				}
+				let mut full_superblock = ext2.superblock.as_bytes().to_vec();
+				let superblock_unused_bytes = disk.split_at(EXT2_END_OF_SUPERBLOCK).0.split_at(EXT2_START_OF_SUPERBLOCK+full_superblock.len()).1; //these are unused, so could just overwrite with resize e.g. row below, but this preserves file contents exactly
+				//full_superblock.resize(EXT2_END_OF_SUPERBLOCK - EXT2_START_OF_SUPERBLOCK, 0u8);
+				full_superblock.extend_from_slice(superblock_unused_bytes);
+				if let Err(e) = device_out.write_all(full_superblock.as_slice()) {
+						println!("write failed on superblock with error {}", e);
+				}
+				let mut group_descriptors = Vec::new();
+				for descriptor in ext2.block_groups.iter() {
+					group_descriptors.extend_from_slice(descriptor.as_bytes());
+				}
+				group_descriptors.resize(ext2.block_size,0u8);
+				if let Err(e) = device_out.write_all(group_descriptors.as_slice()) {
+					println!("write failed on block group descriptors with error {}", e);
+				}
+                for (i,block) in ext2.blocks.iter().enumerate() {
+					if let Err(e) = device_out.write_all(block) {
+						println!("write failed on block {} with error {}", i, e);
+					}
+					println!("write block {} of {}", i, ext2.superblock.blocks_count-ext2.blocks_offset);
+				}
+				device_out.flush()?;
+                println!("unmount complete");
+                break;
             } else if line.starts_with("mount") {
                 // `mount host_filename mountpoint`
                 // mount an ext2 filesystem over an existing empty directory
@@ -976,7 +1008,7 @@ fn main() -> Result<()> {
                 // consider what to do if arg2 does- or does-not end in "/"
                 // and/or if arg2 is an existing directory name
                 //currently no plans to implement
-                //cannot create a hard link to a directory (prevent loop)
+                //do not create a hard link to a directory (prevent loops)
                 println!("link not yet implemented");
             } else if line.starts_with("quit") || line.starts_with("exit") {
                 break;
