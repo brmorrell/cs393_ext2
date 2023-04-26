@@ -968,7 +968,7 @@ fn main() -> Result<()> {
                 // `unmount`
                 // quits the filesystem and writes changes out to the device (file)
                 //TODO: should this wait until every block is done to actually write them, somehow?
-                let mut device_out = File::create("./myfsplusbeemovie2.ext2")?;
+                let mut device_out = File::create("./myfsplusbeemovie.ext2")?;
                 let boot_block = disk.split_at(EXT2_START_OF_SUPERBLOCK).0;
                 if let Err(e) = device_out.write_all(boot_block) {
 						println!("write failed on boot block with error {}", e);
@@ -992,7 +992,6 @@ fn main() -> Result<()> {
 					if let Err(e) = device_out.write_all(block) {
 						println!("write failed on block {} with error {}", i, e);
 					}
-					println!("write block {} of {}", i, ext2.superblock.blocks_count-ext2.blocks_offset);
 				}
 				device_out.flush()?;
                 println!("unmount complete");
