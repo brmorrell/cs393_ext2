@@ -1,7 +1,7 @@
 #![feature(int_roundings)]
 
 mod structs;
-use crate::structs::{BlockGroupDescriptor, DirectoryEntry, Inode, Superblock, TypePerm};
+use crate::structs::{BlockGroupDescriptor, DirectoryEntry, Inode, Superblock, TypePerm, TypeIndicator};
 use std::mem;
 use null_terminated::NulStr;
 use uuid::Uuid;
@@ -194,6 +194,63 @@ impl Ext2 {
 		}
 		Err(std::io::Error::new(std::io::ErrorKind::Other,"no free blocks"))
 	}
+	
+	fn dealloc_inode(&mut self, inode_num: usize) -> std::io::Result<()> {
+		let is_dir = self.get_inode(inode_num).type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY;
+		if is_dir {
+			//decrement hard link counter for each child (should just be . and ..)
+			let children = self.read_dir_inode(inode_num)?;
+			for (child,_) in children {
+				let mut child_inode = self.get_mut_inode(child);
+				child_inode.hard_links -= 1;
+			}
+		}
+		let inode = self.get_mut_inode(inode_num);
+		//dealloc data blocks
+		for block in inode.get_all_blocks(self) {
+			self.dealloc_block(block as usize)?;
+		}
+		//update block group and superblock
+		let group_num: usize = (inode_num - 1) / self.superblock.inodes_per_group as usize;
+        let index: usize = (inode_num - 1) % self.superblock.inodes_per_group as usize;
+        let group = &mut self.block_groups[group_num];
+        
+        let bitmap_ptr = self.blocks[group.inode_usage_addr as usize - self.block_offset].as_ptr();
+		let bitmap = unsafe {
+			std::slice::from_raw_parts_mut(
+					bitmap_ptr as *mut u8,
+					(self.superblock.inodes_per_group/8) as usize,
+				)
+			};
+			
+		bitmap[index/8] = bitmap[index]^(0x80u8>>(index%8));
+		group.free_inodes_count += 1;
+		if is_dir {
+			group.dirs_count -=1;
+		}
+		self.superblock.free_inodes_count += 1;
+		return Ok(());
+	}
+	
+	fn dealloc_block(&mut self, block: usize) -> std::io::Result<()> {
+		//update block group and superblock
+		let group_num: usize = block / self.superblock.blocks_per_group as usize;
+        let index: usize = block % self.superblock.blocks_per_group as usize;
+        let group = &mut self.block_groups[group_num];
+        
+        let bitmap_ptr = self.blocks[group.block_usage_addr as usize - self.block_offset].as_ptr();
+		let bitmap = unsafe {
+			std::slice::from_raw_parts_mut(
+					bitmap_ptr as *mut u8,
+					(self.superblock.blocks_per_group/8) as usize,
+				)
+			};
+			
+		bitmap[index/8] = bitmap[index]^(0x80u8>>(index%8));
+		group.free_blocks_count += 1;
+		self.superblock.free_blocks_count += 1;
+		return Ok(());
+	}
     
     pub fn add_dir(&mut self, root_inode: usize, name: &str) -> std::io::Result<()>{
 		let new_inode = self.alloc_inode()?;
@@ -224,8 +281,8 @@ impl Ext2 {
 		
 		//make this add an inode, then add a directory entry to this root,
 		//then add . and ..  pointing to the appropriate inodes (and update inode struct appropriately)
-		let name_len = (name.len()+1) as u8;
-		let dir_entry_size = (name_len+8) as usize;
+		let bytes_to_write = Self::dir_entry_as_bytes(new_inode as u32,TypeIndicator::Directory, name);
+		let dir_entry_size = (((bytes_to_write[4] as u16) << 8) | bytes_to_write[5] as u16) as usize;
 		
 		// TODO: check for entries that are already padding to the end of the block and fix that
 		// the way that this is set up, that will only be relevant for entries from the original file
@@ -249,44 +306,24 @@ impl Ext2 {
 			
 		    //now get a new block
 		    //all of these call get_mut_inode again because root these are mutable references to self being passed
-		    println!("not enough space in last block of root");
+		    //println!("not enough space in last block of root");
 			root.to_new_block(self)?;
 		}
 		
 		//write the directory entry to the file
-		
-		let mut bytes_to_write = Vec::<u8>::new();
-		bytes_to_write.extend_from_slice(&(new_inode as u32).to_le_bytes());
-		bytes_to_write.extend_from_slice(&(dir_entry_size as u16).to_le_bytes());
-		bytes_to_write.push(name_len);
-		bytes_to_write.push(0x00u8); //type_indicator not specified for now
-		bytes_to_write.extend_from_slice(name.as_bytes());
-		bytes_to_write.push(0x00u8); //nul terminator
-		
-		println!("appending {} bytes to root", bytes_to_write.len());
-		println!("fields of new directory entry: inode: {}, entry_size: {}, name_len: {}, type_indicator: {}, str name: {}", new_inode, dir_entry_size, name_len, 0x00u8, name);
+		//println!("appending {} bytes to root", bytes_to_write.len());
+		//println!("fields of new directory entry: inode: {}, entry_size: {}, name_len: {}, type_indicator: {}, str name: {}", new_inode, dir_entry_size, name_len, 0x00u8, name);
 		root.append_to_file(&bytes_to_write, self)?;
 		
 		
 		//upkeep - inode, superblock, block group, directory entries
 		// . and .. directories
-		let mut tree_links = Vec::<u8>::new();
-		tree_links.extend_from_slice(&(new_inode as u32).to_le_bytes());
-		tree_links.extend_from_slice(&10u16.to_le_bytes());
-		tree_links.push(2u8);
-		tree_links.push(0x00u8);
-		tree_links.extend_from_slice(".".as_bytes());
-		tree_links.push(0x00u8);
-		tree_links.extend_from_slice(&(root_inode as u32).to_le_bytes());
-		tree_links.extend_from_slice(&11u16.to_le_bytes());
-		tree_links.push(3u8);
-		tree_links.push(0x00u8);
-		tree_links.extend_from_slice("..".as_bytes());
-		tree_links.push(0x00u8);
+		let mut tree_links = Self::dir_entry_as_bytes(new_inode as u32,TypeIndicator::Directory, ".");
+		tree_links.append(&mut Self::dir_entry_as_bytes(root_inode as u32,TypeIndicator::Directory, ".."));
 		
-		println!("appending {} bytes to new", tree_links.len());
-		println!("important fields of . directory entry: inode: {}", new_inode);
-		println!("important fields of .. directory entry: inode: {}", root_inode);
+		//println!("appending {} bytes to new dir", tree_links.len());
+		//println!("important fields of . directory entry: inode: {}", new_inode);
+		//println!("important fields of .. directory entry: inode: {}", root_inode);
 		new.append_to_file(&tree_links, self)?;
 		
 		//set new inode and block group values
@@ -302,7 +339,161 @@ impl Ext2 {
 		//set type & perms
 		new.type_perm = TypePerm::DIRECTORY;
 		
-		println!("performed upkeep");
+		//println!("performed upkeep");
+		Ok(())
+	}
+	
+	//removes target file or directory
+	//assumed to be recursive, so check for contents elsewhere
+	pub fn remove(&mut self, root_inode: usize, target_inode: usize) -> std::io::Result<()>{
+		//this code just grabs the inode from self, as a mutable reference, without needing to keep
+		//around an extra mutable reference to self
+		let root_group: usize = (root_inode - 1) / self.superblock.inodes_per_group as usize;
+        let root_index: usize = (root_inode - 1) % self.superblock.inodes_per_group as usize;
+
+        // println!("in get_inode, inode num = {}, index = {}, group = {}", inode, index, group);
+        let root_inode_table_block = (self.block_groups[root_group].inode_table_block) as usize - self.block_offset;
+        let root_offset: isize = (root_index*std::mem::size_of::<Inode>()).try_into().unwrap();
+        let root_inode_location = self.blocks[root_inode_table_block].as_ptr();
+        // println!("in get_inode, block number of inode table {}", inode_table_block);
+        let root = unsafe {
+            &mut *(root_inode_location.offset(root_offset) as *mut Inode)
+        };
+        
+        let target_group: usize = (target_inode - 1) / self.superblock.inodes_per_group as usize;
+        let target_index: usize = (target_inode - 1) % self.superblock.inodes_per_group as usize;
+        
+        let target_inode_table_block = (self.block_groups[target_group].inode_table_block) as usize - self.block_offset;
+        let target_inode_offset: isize = (target_index*std::mem::size_of::<Inode>()).try_into().unwrap();
+        let target_inode_location = self.blocks[target_inode_table_block].as_ptr();
+        // println!("in get_inode, block number of inode table {}", inode_table_block);
+        let mut target = unsafe {
+            &mut *(target_inode_location.offset(target_inode_offset) as *mut Inode)
+        };
+		
+		//remove the directory entry in root
+        let dir_size = root.size_low;
+		let dir_blocks = root.get_all_blocks(&self);
+        let mut target_block = (0,0); //(block,index in inode)
+        let mut target_offset = 0;
+        let mut remaining_dirs = Vec::new();
+        let mut last_entry_size = 0;
+        //find the target block
+        for i in 0..dir_blocks.len() {
+			let entry_ptr = self.blocks[dir_blocks[i] as usize - self.block_offset].as_ptr();
+		    let mut byte_offset: isize = 0;
+	        while byte_offset < self.block_size.try_into().unwrap() && (i*self.block_size) as isize + byte_offset < dir_size as isize { 
+	            let directory = unsafe { 
+		        	&*(entry_ptr.offset(byte_offset) as *const DirectoryEntry) 
+		    	};
+		    	//if we're past our target, add to the list of dirs
+		        if target_block.0 != 0 {
+					remaining_dirs.push(directory);
+				}
+		        if directory.inode == target_inode as u32 {
+					target_block = (dir_blocks[i],i);
+					target_offset = byte_offset;
+				} else {
+					last_entry_size = directory.entry_size;
+				}
+				//assume that the directory size was aligned properly to the block
+		        byte_offset += directory.entry_size as isize;
+		    }
+		    if target_block.0 != 0 {break;}
+		}
+		if target_block.0 == 0 {return Err(std::io::Error::new(std::io::ErrorKind::Other,"target does not exist"));}
+		
+		//rearrange directory entries to prevent fragmentation, but use minimal movement
+		//pack the target block
+		let old_data = &self.blocks[target_block.0 as usize];
+		let mut target_data: Vec<u8> = Vec::new();
+		target_data.extend_from_slice(&old_data[..target_offset as usize]);
+		for dir in remaining_dirs {
+			let mut entry = Self::dir_entry_as_bytes(dir.inode,dir.type_indicator,&dir.name.to_string());
+			target_data.append(&mut entry);
+		}
+		let mut extra_space = self.block_size - target_data.len();
+		
+		
+		//get the entries from the last block and move to target block, unless target is last block
+		if target_block.1 != dir_blocks.len()-1 {
+			let mut last_entries = Vec::new();
+			let entry_ptr = self.blocks[dir_blocks[dir_blocks.len()-1] as usize - self.block_offset].as_ptr();
+		    let mut byte_offset: isize = 0;
+	        while byte_offset < self.block_size.try_into().unwrap() && ((dir_blocks.len()-1)*self.block_size) as isize + byte_offset < dir_size as isize { 
+	            let directory = unsafe { 
+		        	&*(entry_ptr.offset(byte_offset) as *const DirectoryEntry) 
+		    	};
+		    	//assemble list of dirs
+				last_entries.push(directory);
+				//assume that the directory size was aligned properly to the block
+		        byte_offset += directory.entry_size as isize;
+		    }
+		    //now pull from here to fill in the remaining block size, then reconstruct last block
+		    //okay this for loop could definitely just go in the while loop above, but this might be nicer organizationally?
+		    let old_last_data = &self.blocks[dir_blocks[dir_blocks.len()-1] as usize];
+			let mut new_last_data: Vec<u8> = Vec::new();
+			for dir in last_entries {
+				let mut entry = Self::dir_entry_as_bytes(dir.inode,dir.type_indicator,&dir.name.to_string());
+				if ((entry[4] as usize) << 8) | entry[5] as usize <= extra_space {
+					last_entry_size = ((entry[4] as u16) << 8) | entry[5] as u16;
+					extra_space -= last_entry_size as usize;
+					target_data.append(&mut entry);
+				} else {
+					new_last_data.append(&mut entry);
+				}
+			}
+			//size the last entry appropriately (don't bother checking if this is now the last block)
+			let padded_size = (last_entry_size as usize + self.block_size - target_data.len()) as u16;
+			let size_loc = target_data.len()-last_entry_size as usize+4;
+			target_data[size_loc] = padded_size.to_le_bytes()[0];
+			target_data[size_loc+1] = padded_size.to_le_bytes()[1];
+			//write last block data
+			if old_last_data.len() > 0 {
+				root.write_block(self, dir_blocks.len()-1, Some(&mut new_last_data))?;
+			} else {
+				root.write_block(self, dir_blocks.len()-1, None)?;
+			}
+		}
+		
+		//write new directory contents to root, dealloc blocks if necessary
+		root.write_block(self, target_block.1, Some(&mut target_data))?;
+		
+		//decrement hard_links counter for target
+		target.hard_links -= 1;
+		
+        //recursively clear out directory
+		if target.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
+			//clear out children (would use read_dir_inode, but that holds the immutable reference to self while we remove)
+	        let dir_size = target.size_low;
+			let dir_blocks = target.get_all_blocks(&self);
+	        let mut blocks_read = 0;
+	        for block in dir_blocks {
+				let entry_ptr = self.blocks[block as usize - self.block_offset].as_ptr();
+			    let mut byte_offset: isize = 0;
+		        while byte_offset < self.block_size.try_into().unwrap() && (blocks_read*self.block_size) as isize + byte_offset < dir_size as isize { 
+		            let child = unsafe { 
+			        	&*(entry_ptr.offset(byte_offset) as *const DirectoryEntry) 
+			    	};
+			        //assume that the directory size was aligned properly to the block
+					if child.inode as usize != root_inode && child.inode as usize != target_inode {
+						//don't recurse on those, just ignore them and "unlink" later by deallocing
+						self.remove(target_inode,child.inode as usize)?;
+					}
+			        byte_offset += child.entry_size as isize;
+			    }
+			    blocks_read += 1;
+	        }
+	        target.hard_links -= 1; //for . directory (we will just dealloc the blocks)
+	        root.hard_links -= 1; //for .. directory
+		}
+		
+		
+		//dealloc target inode and blocks if hard_links hits 0, ignoring the . link if it's a directory
+		if target.hard_links == 0 {
+			self.dealloc_inode(target_inode)?;
+		}
+		
 		Ok(())
 	}
 	
@@ -369,6 +560,19 @@ impl Ext2 {
 		}
 		all_blocks
 	}
+	
+	pub fn dir_entry_as_bytes(inode: u32, type_ind: TypeIndicator, name: &str) -> Vec<u8> {
+		let name_len = (name.len()+1) as u8;
+		let entry_size = (name_len+8) as u16;
+		let mut bytes = Vec::<u8>::new();
+		bytes.extend_from_slice(&inode.to_le_bytes());
+		bytes.extend_from_slice(&entry_size.to_le_bytes());
+		bytes.push(name_len);
+		bytes.push(type_ind as u8); //type_indicator not specified for now
+		bytes.extend_from_slice(name.as_bytes());
+		bytes.push(0x00u8); //nul terminator
+		bytes
+	}
 }
 
 impl fmt::Debug for Inode<> {
@@ -388,12 +592,7 @@ impl fmt::Debug for Inode<> {
 
 impl Inode {
 	pub fn get_all_blocks(&self, ext2: &Ext2) -> Vec<u32> {
-		let file_size;
-		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
-			file_size = self.size_low as u64;
-		} else {
-			file_size = (self.size_low as u64) + (self.size_high as u64)<<32;
-		}
+		let file_size = self.file_size();
 		let mut blocks = Vec::new();
 		for ptr in self.direct_pointer{
 			if ptr as usize > ext2.block_offset && blocks.len()*ext2.block_size < file_size as usize {
@@ -420,12 +619,7 @@ impl Inode {
 	}
 	
 	pub fn block_space_left(&self,ext2: &Ext2) -> usize{
-		let file_size;
-		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
-			file_size = self.size_low as u64;
-		} else {
-			file_size = (self.size_low as u64) + (self.size_high as u64)<<32;
-		}
+		let file_size = self.file_size();
 		//add to the file size
 		if file_size as usize % ext2.block_size == 0 {
 			0
@@ -444,25 +638,36 @@ impl Inode {
 		} else {
 			ext2.read_triple_ptr_block(self.triply_indirect)[n-12 - ext2.block_size/4 - ext2.block_size*ext2.block_size/16]
 		}
-		
+	}
+	
+	pub fn set_block(&mut self, n: usize, block: u32, ext2: &Ext2) -> std::io::Result<()>{
+		//out of bounds
+		if n >= 12 + ext2.block_size/4 + ext2.block_size*ext2.block_size/16 + ext2.block_size*ext2.block_size*ext2.block_size/64 {
+			return Err(std::io::Error::new(std::io::ErrorKind::Other,"error block index out of bounds"));
+		}
+		if n < 12 {
+			self.direct_pointer[n] = block;
+		} else if n < 12 + ext2.block_size/4 {
+			ext2.read_ptr_block(self.indirect_pointer)[n-12] = block;
+		} else if n < 12 + ext2.block_size/4 + ext2.block_size*ext2.block_size/16 {
+			ext2.read_double_ptr_block(self.doubly_indirect)[n-12 - ext2.block_size/4] = block;
+		} else {
+			ext2.read_triple_ptr_block(self.triply_indirect)[n-12 - ext2.block_size/4 - ext2.block_size*ext2.block_size/16] = block;
+		}
+		Ok(())
 	}
 	
 	//gets the last allocated block, if it exists
 	pub fn get_last_block(&self, ext2: &Ext2) -> Option<u32> {
-		let file_size;
-		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
-			file_size = self.size_low as u64;
-		} else {
-			file_size = (self.size_low as u64) + (self.size_high as u64)<<32;
-		}
+		let file_size = self.file_size();
 		if file_size == 0 {println!("The file size is 0",);return None;}
 		
 		let num_blocks = (file_size as usize - 1)/ext2.block_size;
-		println!("The last block of the file is {}, and is block {} of the file",self.get_block(num_blocks as usize,ext2),num_blocks);
+		//println!("The last block of the file is {}, and is block {} of the file",self.get_block(num_blocks as usize,ext2),num_blocks);
 		Some(self.get_block(num_blocks as usize,ext2))
 	}
 	
-	pub fn to_new_block(&mut self, ext2: &mut Ext2) -> std::io::Result<u32> {
+	fn to_new_block(&mut self, ext2: &mut Ext2) -> std::io::Result<u32> {
 		let mut file_size;
 		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
 			file_size = self.size_low as u64;
@@ -474,37 +679,18 @@ impl Inode {
 		self.size_low = file_size as u32;
 		self.size_high = (file_size>>32) as u32;
 		let num_blocks = (file_size as usize)/ext2.block_size;
-		//out of blocks
-		if num_blocks >= 11 + ext2.block_size/4 + ext2.block_size*ext2.block_size/16 + ext2.block_size*ext2.block_size*ext2.block_size/64 {
-			return Err(std::io::Error::new(std::io::ErrorKind::Other,"max file blocks reached"));
-		}
 		
 		//alloc new block and add it
 		let next_block = ext2.alloc_block()?;
-		if file_size == 0 {
-			self.direct_pointer[0] = next_block;
-		} else if num_blocks < 11 {
-			self.direct_pointer[num_blocks+1] = next_block;
-		} else if num_blocks < 11 + ext2.block_size/4 {
-			ext2.read_ptr_block(self.indirect_pointer)[num_blocks-11] = next_block;
-		} else if num_blocks < 11 + ext2.block_size/4 + ext2.block_size*ext2.block_size/16 {
-			ext2.read_double_ptr_block(self.doubly_indirect)[num_blocks-11 - ext2.block_size/4] = next_block;
-		} else {
-			ext2.read_triple_ptr_block(self.triply_indirect)[num_blocks-11 - ext2.block_size/4 - ext2.block_size*ext2.block_size/16] = next_block;
-		}
-		println!("inode only has {} space left",self.block_space_left(ext2));
-		println!("inode moved to new block {}; it is block {} of the inode",next_block, num_blocks);
+		self.set_block(num_blocks, next_block, ext2)?;
+		//println!("inode only has {} space left",self.block_space_left(ext2));
+		//println!("inode moved to new block {}; it is block {} of the inode",next_block, num_blocks);
 		Ok(next_block)
 	}
 	
 	//need to make everything consistent with behaviour on block boundaries.  Decide when to add new blocks, how to check for existing blocks
 	fn append_to_file(&mut self, bytes: &[u8], ext2: &mut Ext2) -> std::io::Result<usize> {
-		let mut file_size;//check file size at beginning
-		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
-			file_size = self.size_low as u64;
-		} else {
-			file_size = (self.size_low as u64) + (self.size_high as u64)<<32;
-		}
+		let mut file_size = self.file_size();//check file size at beginning
 		
 		let mut next_block;
 		let mut byte_offset: usize = ext2.block_size - self.block_space_left(ext2);
@@ -516,7 +702,7 @@ impl Inode {
 			next_block = self.to_new_block(ext2)?;
 			byte_offset = 0;
 		}
-		println!("appending to file on block: {}; space left to write is {}", next_block, self.block_space_left(ext2));
+		//println!("appending to file on block: {}; space left to write is {}", next_block, self.block_space_left(ext2));
 		let mut block_ptr = ext2.blocks[next_block as usize - ext2.block_offset].as_ptr();
 		let mut block_bytes = unsafe {
 			std::slice::from_raw_parts_mut(
@@ -528,7 +714,7 @@ impl Inode {
 		let mut bytes_written = 0;
 		
 		for byte in bytes {
-			println!("writing byte {} of block {}; there are {} bytes remaining", byte_offset, next_block,ext2.block_size-byte_offset);
+			//println!("writing byte {} of block {}; there are {} bytes remaining", byte_offset, next_block,ext2.block_size-byte_offset);
 			if byte_offset == 1024 {
 				next_block = self.to_new_block(ext2)?;
 				block_ptr = ext2.blocks[next_block as usize - ext2.block_offset].as_ptr();
@@ -540,7 +726,7 @@ impl Inode {
 				};
 				byte_offset = 0;
 			}
-			println!("continued appending on new block {} with offset {}; {} space left in this block",next_block,byte_offset,ext2.block_size-byte_offset);
+			//println!("continued appending on new block {} with offset {}; {} space left in this block",next_block,byte_offset,ext2.block_size-byte_offset);
 			block_bytes[byte_offset] = *byte;
 			byte_offset += 1;
 			bytes_written += 1;
@@ -551,6 +737,49 @@ impl Inode {
 		}
 		
 		Ok(bytes_written)
+	}
+	
+	fn write_block(&mut self, ext2: &mut Ext2, block_index: usize, new_data: Option<&mut [u8]>) -> std::io::Result<()> {
+		let mut file_size = self.file_size();
+		if let Some(data) = new_data{
+			//if writing to the last block, should adjust file size
+			if block_index == (file_size as usize - 1)/ext2.block_size {
+				file_size = (block_index*ext2.block_size+data.len()) as u64;
+				self.size_low = file_size as u32;
+				self.size_high = (file_size>>32) as u32;
+				if data.len() == 0 {
+					//dealloc the block if we just wrote a blank block as the last block
+					ext2.dealloc_block(self.get_block(block_index,ext2) as usize)?;
+				}
+			}
+			
+			//write the new data at block granularity
+			//TODO: could maybe have offset?
+			let block = self.get_block(block_index, ext2) as usize;
+			for i in 0..data.len() {
+				ext2.blocks[block][i] = data[i];
+			}
+		} else {
+			//if None, dealloc the block
+			ext2.dealloc_block(self.get_block(block_index, ext2) as usize)?;
+			//then rearrange all the relevant pointers
+			for i in block_index..=((file_size as usize - 1)/ext2.block_size) {
+				self.set_block(i, self.get_block(i+1, ext2), ext2)?;
+			}
+			//and set filesize
+			file_size -= ext2.block_size as u64;
+			self.size_low = file_size as u32;
+			self.size_high = (file_size>>32) as u32;
+		}
+		Ok(())
+	}
+	
+	pub fn file_size(&self) -> u64 {
+		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
+			self.size_low as u64
+		} else {
+			(self.size_high as u64)<<32 | (self.size_low as u64)
+		}
 	}
 	
 }
@@ -679,16 +908,75 @@ fn main() -> Result<()> {
             } else if line.starts_with("rm") {
                 // `rm target`
                 // unlink a file or empty directory
-                println!("rm not yet implemented");
+                // `rm -r target` to recursively empty a directory
+                // get the target and check for -r
+                let elts: Vec<&str> = line.split(' ').collect();
+                if elts.len() == 1 {
+     				println!("must supply an argument to rm")
+                } else {
+					let options = &elts[1..elts.len()-1]; //in case I want to add other options, this is easier to work with
+                    let filename = elts[elts.len()-1];
+                    let mut found = false;
+                    for file in &dirs {
+                        if file.1.to_string().eq(filename){
+							found = true;
+							let target_inode = ext2.get_inode(file.0);
+							let is_dir = target_inode.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY;
+							if target_inode.type_perm & TypePerm::FILE == TypePerm::FILE || (is_dir && options.contains(&"-r")){
+								if let Err(err) = ext2.remove(current_working_inode,file.0) {
+									println!("unable to remove {}, encountered error: {}",filename,err);
+								}
+							} else if is_dir {
+								if let Ok(target_contents) = ext2.read_dir_inode(file.0) {
+									if target_contents.len() <= 2 {
+										if let Err(err) = ext2.remove(current_working_inode,file.0) {
+											println!("unable to remove {}, encountered error: {}",filename,err);
+										}
+									} else {
+										println!("{} is not empty.",filename);
+									}
+								}
+                            } else {
+								println!("{} is not a file or directory",filename);
+							}
+							break;
+						}
+                    }
+                    if !found {
+						println!("{} does not exist", filename);
+                    }
+                }
+            } else if line.starts_with("mv") {
+                // `mv filename target`
+                // copies filename to target file
+                println!("mv not yet implemented");
+            } else if line.starts_with("import") {
+                // `import host_file target_name`
+                // import a file from the host system as target_name
+                //TODO: this
+                println!("import not yet implemented");
+            } else if line.starts_with("export") {
+                // `export filename host_target`
+                // writes filename out to the host system at host_target
+                //TODO: this
+                println!("export not yet implemented");
+            } else if line.starts_with("unmount") {
+                // `unmount`
+                // quits the filesystem and writes changes out to the device
+                //TODO: this
+                println!("export not yet implemented");
             } else if line.starts_with("mount") {
                 // `mount host_filename mountpoint`
                 // mount an ext2 filesystem over an existing empty directory
+                //currently no plans to implement
                 println!("mount not yet implemented");
             } else if line.starts_with("link") {
                 // `link arg_1 arg_2`
                 // create a hard link from arg_1 to arg_2
                 // consider what to do if arg2 does- or does-not end in "/"
                 // and/or if arg2 is an existing directory name
+                //currently no plans to implement
+                //cannot create a hard link to a directory (prevent loop)
                 println!("link not yet implemented");
             } else if line.starts_with("quit") || line.starts_with("exit") {
                 break;

@@ -127,7 +127,6 @@ pub struct BlockGroupDescriptor {
 }
 
 #[repr(C)]
-#[derive(Clone)]
 pub struct Inode {
     /// Type and Permissions (see below)
     pub type_perm: TypePerm,
@@ -200,6 +199,8 @@ pub struct DirectoryEntry {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
+#[derive(Copy)]
 pub enum TypeIndicator {
     Unknown,
     Regular,
