@@ -8,7 +8,7 @@ use uuid::Uuid;
 use zerocopy::{ByteSliceMut, AsBytes};
 use std::fmt;
 use rustyline::{DefaultEditor, Result};
-use std::fs::File;
+use std::fs::File;//could try to read in fs with this
 use std::io::Write;
 
 #[repr(C)]
@@ -504,20 +504,20 @@ impl Ext2 {
     pub fn read_dir_inode(&self, inode: usize) -> std::io::Result<Vec<(usize, &NulStr)>> {
         let mut ret = Vec::new();
         let root = self.get_inode(inode);
-        println!("in read_dir_inode, #{} : {:?}", inode, root);
+        //println!("in read_dir_inode, #{} : {:?}", inode, root);
         let dir_size = root.size_low;
 		let dir_blocks = root.get_all_blocks(&self);
         let mut blocks_read = 0;
         for block in dir_blocks {
-			println!("readng block {} of the directory", blocks_read);
-			println!("following pointer to data block: {}", block);
+			//println!("readng block {} of the directory", blocks_read);
+			//println!("following pointer to data block: {}", block);
 			let entry_ptr = self.blocks[block as usize - self.block_offset].as_ptr();
 		    let mut byte_offset: isize = 0;
 	        while byte_offset < self.block_size.try_into().unwrap() && (blocks_read*self.block_size) as isize + byte_offset < dir_size as isize { 
 	            let directory = unsafe { 
 		        	&*(entry_ptr.offset(byte_offset) as *const DirectoryEntry) 
 		    	};
-		        println!("found {:?}", directory);
+		        //println!("found {:?}", directory);
 		        //assume that the directory size was aligned properly to the block
 				ret.push((directory.inode as usize, &directory.name));
 		        byte_offset += directory.entry_size as isize;
@@ -575,6 +575,43 @@ impl Ext2 {
 		bytes.extend_from_slice(name.as_bytes());
 		bytes.push(0x00u8); //nul terminator
 		bytes
+	}
+	
+	pub fn parse_path(&self, root_inode: usize, pathname: &str) -> std::io::Result<usize> {
+		let last_name = match pathname.split('/').filter(|&x| !x.is_empty()).last() {
+			Some(name) => name,
+			None => ""
+		};
+        let path = pathname.split('/').filter(|&x| !x.is_empty());
+        let mut parent_inode = root_inode;
+       	for dir in path {
+			let mut found = false;
+			let children = match self.read_dir_inode(parent_inode) {
+				Ok(dir_listing) => dir_listing,
+				Err(_) => {
+					return Err(std::io::Error::new(std::io::ErrorKind::Other,"unable to read directory"));
+				}
+			};
+		    for child in &children {
+		    	if child.1.to_string().eq(dir){
+					if dir == last_name { //if this is the end of the path, return
+						return Ok(child.0);
+					}
+					found = true;
+					let new_inode = self.get_inode(child.0);
+					//otherwise we need to read a directory
+					if new_inode.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
+			   			parent_inode = child.0;
+		  			} else {
+						return Err(std::io::Error::new(std::io::ErrorKind::Other,format!("{} is not a valid path", pathname)));
+					}
+		    	}
+			}
+			if !found {
+		  		return Err(std::io::Error::new(std::io::ErrorKind::Other,format!("unable to locate {}", dir)));
+		   	}
+		}
+		return Err(std::io::Error::new(std::io::ErrorKind::Other,"empty path"));
 	}
 }
 
@@ -663,7 +700,10 @@ impl Inode {
 	//gets the last allocated block, if it exists
 	pub fn get_last_block(&self, ext2: &Ext2) -> Option<u32> {
 		let file_size = self.file_size();
-		if file_size == 0 {println!("The file size is 0",);return None;}
+		if file_size == 0 {
+			//println!("The file size is 0",);
+			return None;
+		}
 		
 		let num_blocks = (file_size as usize - 1)/ext2.block_size;
 		//println!("The last block of the file is {}, and is block {} of the file",self.get_block(num_blocks as usize,ext2),num_blocks);
@@ -788,6 +828,7 @@ impl Inode {
 }
 
 fn main() -> Result<()> {
+	//TODO read from file?
     let mut disk = include_bytes!("../myfsplusbeemovie.ext2").to_vec();
     let start_addr: usize = disk.as_mut_ptr() as usize;
     let mut ext2 = Ext2::new(&mut disk[..], start_addr);
@@ -811,11 +852,39 @@ fn main() -> Result<()> {
         if let Ok(line) = buffer {
             if line.starts_with("ls") {
                 // `ls` prints our cwd's children
-                // TODO: support arguments to ls (print that directory's children instead)
-                for dir in &dirs {
-                    print!("{}\t", dir.1);
-                }
-                println!();    
+                // supports arguments (print that directory's children instead)
+                let elts: Vec<&str> = line.split(' ').collect();
+                if elts.len() == 1 {//save neglible time by skipping parse_path (also don't have a pathname here)
+     				for dir in &dirs {
+                    	print!("{}\t", dir.1);
+                    }
+                    println!();
+                } else {
+					let target = elts[1];
+					let target_inode = match ext2.parse_path(current_working_inode, target) {
+						Ok(inode) => inode,
+						Err(e) => {println!("{}", e);
+				                break;}
+					};
+					if ext2.get_inode(target_inode).type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
+						let target_children = match ext2.read_dir_inode(target_inode) {
+				            Ok(dir_listing) => {
+				                dir_listing
+				            },
+				            Err(_) => {
+				                println!("unable to read target");
+				                break;
+				            }
+				        };
+						for dir in &target_children {
+	                    	print!("{}\t", dir.1);
+	                    }
+	                    println!();
+                    } else {
+						println!("{} is not a directory", target);
+					}
+				}
+                
             } else if line.starts_with("cd") {
                 // `cd` with no arguments, cd goes back to root
                 // `cd dir_name` moves cwd to that directory
@@ -823,30 +892,25 @@ fn main() -> Result<()> {
                 if elts.len() == 1 {
      				current_working_inode = 2;
                 } else {
-                    // TODO: if the argument is a path, follow the path
+                    // if the argument is a path, follow the path
                     // e.g., cd dir_1/dir_2 should move you down 2 directories
                     // deeper into dir_2
                     let to_dir = elts[1];
-                    let mut found = false;
-                    for dir in &dirs {
-                        if dir.1.to_string().eq(to_dir){
-							found = true;
-							let new_inode = ext2.get_inode(dir.0);
-							if new_inode.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
-	                            current_working_inode = dir.0;
-                            } else {
-								println!("can only cd into a directory");
-							}
-                        }
-                    }
-                    if !found {
-                        println!("unable to locate {}, cwd unchanged", to_dir);
-                    }
+                    let new_inode = match ext2.parse_path(current_working_inode, to_dir) {
+						Ok(inode) => inode,
+						Err(e) => {println!("{}", e);
+				                break;}
+					};
+					if ext2.get_inode(new_inode).type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
+		            	current_working_inode = new_inode;
+	                } else {
+						println!("can only cd into a directory");
+					}
                 }
             } else if line.starts_with("mkdir") {
                 // `mkdir childname`
                 // create a directory with the given name, add a link to cwd
-                // consider supporting `-p path/to_file` to create a path of directories
+                // TODO consider supporting `-p path/to_file` to create a path of directories
                 let elts: Vec<&str> = line.split(' ').collect();
                 if elts.len() == 1 {
      				println!("must supply an argument to mkdir")
@@ -869,44 +933,41 @@ fn main() -> Result<()> {
                 // `cat filename`
                 // print the contents of filename to stdout
                 // if it's a directory, print a nice error
+                // supports file paths
                 let elts: Vec<&str> = line.split(' ').collect();
                 if elts.len() == 1 {
      				println!("must supply an argument to cat")
                 } else {
                     let filename = elts[1];
-                    let mut found = false;
-                    for file in &dirs {
-                        if file.1.to_string().eq(filename){
-							found = true;
-							let file_inode = ext2.get_inode(file.0);
-							if file_inode.type_perm & TypePerm::FILE == TypePerm::FILE {
-								let file_size = (file_inode.size_low as u64) + (file_inode.size_high as u64)<<32;
-								let blocks = file_inode.get_all_blocks(&ext2);
-								let mut size_left = file_size as usize;
-	                            for block_ptr in blocks {
-									if size_left > 0 {
-										let block_index = block_ptr as usize - ext2.block_offset;
-										let contents = match std::str::from_utf8(ext2.blocks[block_index]){
-											Ok(s) => s,
-											Err(_) => "bad file",
-										};
-										if size_left < ext2.block_size {
-											print!("{}", contents.split_at(size_left).0);
-											size_left = 0;
-										} else{
-											print!("{}", contents);
-											size_left -= contents.len();
-										}
-									}
+                    let target_inode = match ext2.parse_path(current_working_inode, filename) {
+						Ok(inode) => inode,
+						Err(e) => {println!("{}", e);
+				                break;}
+					};
+					let file_inode = ext2.get_inode(target_inode);
+					if file_inode.type_perm & TypePerm::FILE == TypePerm::FILE {
+						let file_size = (file_inode.size_low as u64) + (file_inode.size_high as u64)<<32;
+						let blocks = file_inode.get_all_blocks(&ext2);
+						let mut size_left = file_size as usize;
+	                    for block_ptr in blocks {
+							if size_left > 0 {
+								let block_index = block_ptr as usize - ext2.block_offset;
+								let contents = match std::str::from_utf8(ext2.blocks[block_index]){
+									Ok(s) => s,
+									Err(_) => "bad file",
+								};
+								if size_left < ext2.block_size {
+									print!("{}", contents.split_at(size_left).0);
+									size_left = 0;
+								} else{
+									print!("{}", contents);
+									size_left -= contents.len();
 								}
-                            } else {
-								println!("unable to cat, {} is not a file", filename);
 							}
-                        }
-                    }
-                    if !found {
-                        println!("unable to locate {}", filename);
-                    }
+						}
+                	} else {
+						println!("unable to cat, {} is not a file", filename);
+					}
                 }
             } else if line.starts_with("rm") {
                 // `rm target`
@@ -952,6 +1013,8 @@ fn main() -> Result<()> {
             } else if line.starts_with("mv") {
                 // `mv filename target`
                 // copies filename to target file
+                //think about different filesystem destination -- check!!
+                //just needs to link/unlink
                 //TODO: this
                 println!("mv not yet implemented");
             } else if line.starts_with("import") {
