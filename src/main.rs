@@ -532,13 +532,15 @@ impl Ext2 {
 					println!("kept {} in last block", dir.name.to_string());
 				}
 			}
-			//size the last entry appropriately (don't bother checking if this is now the last block)
-			let padded_size = (last_entry_size as usize + self.block_size - target_data.len()) as u16;
-			let size_loc = target_data.len()-last_entry_size as usize+4;
-			target_data[size_loc] = padded_size.to_le_bytes()[0];
-			target_data[size_loc+1] = padded_size.to_le_bytes()[1];
-			//write last block data
-			if old_last_data.len() > 0 {
+			//size the last entry appropriately, if this isn't the last block
+			if new_last_data.len() > 0 {
+				let padded_size = (last_entry_size as usize + self.block_size - target_data.len()) as u16;
+				let size_loc = target_data.len()-last_entry_size as usize+4;
+				target_data[size_loc] = padded_size.to_le_bytes()[0];
+				target_data[size_loc+1] = padded_size.to_le_bytes()[1];
+			}
+			//write last block data (if there is any left)
+			if new_last_data.len() > 0 {
 				//println!("we have data to write to the last block");
 				root.write_block(self, dir_blocks.len()-1, Some(&mut new_last_data))?;
 			} else {
@@ -844,6 +846,11 @@ impl Inode {
 			next_block = self.to_new_block(ext2)?;
 			byte_offset = 0;
 		}
+		println!("before");
+		for i in 0..ext2.blocks[next_block as usize - ext2.block_offset].len() {
+			print!("{} ",ext2.blocks[next_block as usize - ext2.block_offset][i]);
+		}
+		println!();
 		println!("appending to file on block: {}; space left to write is {}", next_block, self.block_space_left(ext2));
 		let mut block_ptr = ext2.blocks[next_block as usize - ext2.block_offset].as_ptr();
 		let mut block_bytes = unsafe {
@@ -877,7 +884,12 @@ impl Inode {
 			self.size_low = file_size as u32;
 			self.size_high = (file_size>>32) as u32;
 		}
-		println!("file size is {} after appending", file_size);
+		println!("after");
+		for i in 0..ext2.blocks[next_block as usize - ext2.block_offset].len() {
+			print!("{} ",ext2.blocks[next_block as usize - ext2.block_offset][i]);
+		}
+		println!();
+		println!("file size is {} after appending, using {} blocks", file_size, self.get_all_blocks(ext2).len());
 		Ok(bytes_written)
 	}
 	
@@ -1024,19 +1036,21 @@ fn main() -> Result<()> {
                 // `mkdir childname`
                 // create a directory with the given name, add a link to cwd
                 // TODO all commands with options should be robust against empty strings
+                //TODO: current bug: if root directory entry was moved, the child directories will get fucked, as will other dirs next to root
                 let elts: Vec<&str> = line.split(' ').collect();
                 if elts.len() == 1 {
      				println!("must supply an argument to mkdir")
                 } else {
 					let options = &elts[1..elts.len()-1]; //in case I want to add other options, this is easier to work with
                     let pathname = elts[elts.len()-1];
+                	
                     if options.contains(&"-p") {
 						let mut found = false;
 						let first_name = pathname.split('/').next().unwrap();
                     	for file in &dirs {
                         	if file.1.to_string().eq(first_name){
 								found = true;
-								println!("{} already exists", first_name);
+								println!("unable to make directory, {} already exists", first_name);
 							}
                    	 	}
 	                    if !found {
@@ -1048,7 +1062,7 @@ fn main() -> Result<()> {
 								};
 							}
 	                    }
-					} else {
+					} else if let Err(_) = ext2.parse_path(current_working_inode, pathname) {
 						let path_vec: Vec<&str> = pathname.split('/').collect();
 						let root_dir = path_vec[..path_vec.len()-1].join("/");
 						let root_inode = match ext2.parse_path(current_working_inode, &root_dir) {
@@ -1061,6 +1075,8 @@ fn main() -> Result<()> {
 								println!("unable to make directory {}, encountered error: {}",pathname,e);
 							}
 						}
+					} else {
+						println!("unable to make directory, {} already exists", pathname);
 					}
                 }
             } else if line.starts_with("cat") {
