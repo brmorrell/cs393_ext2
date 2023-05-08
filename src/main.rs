@@ -226,7 +226,7 @@ impl Ext2 {
 				)
 			};
 			
-		bitmap[index/8] = bitmap[index]^(0x80u8>>(index%8));
+		bitmap[index/8] = bitmap[index/8]^(0x80u8>>(index%8));
 		group.free_inodes_count += 1;
 		//println!("freed inode {}", inode_num);
 		if is_dir {
@@ -250,14 +250,14 @@ impl Ext2 {
 				)
 			};
 			
-		bitmap[index/8] = bitmap[index]^(0x80u8>>(index%8));
+		bitmap[index/8] = bitmap[index/8]^(0x80u8>>(index%8));
 		group.free_blocks_count += 1;
 		self.superblock.free_blocks_count += 1;
 		return Ok(());
 	}
 	
 	pub fn link(&mut self, link_target: usize, link_dir: usize, link_name: &str) -> std::io::Result<()> {
-		println!("calling link from source {} to target dir {} with name {}", link_target, link_dir, link_name);
+		//println!("calling link from source {} to target dir {} with name {}", link_target, link_dir, link_name);
 		//need to get inodes here, as they may be in the same bock group and want to mutate self.blocks later
 		let target_group: usize = (link_target - 1) / self.superblock.inodes_per_group as usize;
         let target_index: usize = (link_target - 1) % self.superblock.inodes_per_group as usize;
@@ -315,11 +315,11 @@ impl Ext2 {
 			
 		    //now get a new block
 		    //all of these call get_mut_inode again because root these are mutable references to self being passed
-		    println!("not enough space in last block of dest");
+		    //println!("not enough space in last block of dest");
 			dest.to_new_block(self)?;
 		}
 		//write the directory entry to the file
-		println!("appending {} bytes to dest", new_entry.len());
+		//println!("appending {} bytes to dest", new_entry.len());
 		dest.append_to_file(&new_entry, self)?;
 		
 		//then increment links counter
@@ -422,7 +422,7 @@ impl Ext2 {
 	//removes target file or directory
 	//assumed to be recursive, so check for contents elsewhere
 	pub fn remove(&mut self, root_inode: usize, target_inode: usize, target_name: &str) -> std::io::Result<()>{
-		println!("removing {} at inode {} from dir {}",target_name,target_inode,root_inode);
+		//println!("removing {} at inode {} from dir {}",target_name,target_inode,root_inode);
 		//TODO fix endless loop? (try rm lost+found)
 		//this code just grabs the inode from self, as a mutable reference, without needing to keep
 		//around an extra mutable reference to self
@@ -464,19 +464,19 @@ impl Ext2 {
 	            let directory = unsafe { 
 		        	&*(entry_ptr.offset(byte_offset) as *const DirectoryEntry) 
 		    	};
-		    	println!("processing {}", directory.name.to_string());
+		    	//println!("processing {}", directory.name.to_string());
 		    	//if we're past our target, add to the list of dirs
 		        if target_block.0 != 0 {
-					println!("adding {} to the list of directories", directory.name.to_string());
+					//println!("adding {} to the list of directories", directory.name.to_string());
 					remaining_dirs.push(directory);
 				}
 				if directory.inode == target_inode as u32 && directory.name.to_string().eq(target_name) {
 					target_block = (dir_blocks[i],i);
 					target_offset = byte_offset;
-					println!("found {}!", directory.name.to_string());
+					//println!("found {}!", directory.name.to_string());
 				} else {
 					last_entry_size = directory.entry_size;
-					println!("setting last entry size to {}", last_entry_size);
+					//println!("setting last entry size to {}", last_entry_size);
 				}
 				//assume that the directory size was aligned properly to the block
 		        byte_offset += directory.entry_size as isize;
@@ -490,19 +490,19 @@ impl Ext2 {
 		let old_data = &self.blocks[target_block.0 as usize - self.block_offset];
 		let mut target_data: Vec<u8> = Vec::new();
 		target_data.extend_from_slice(&old_data[..target_offset as usize]);
-		println!("target_data goes up to {}", target_data.len());
+		//println!("target_data goes up to {}", target_data.len());
 		for dir in remaining_dirs {
-			println!("adding {} back to the block", dir.name.to_string());
+			//println!("adding {} back to the block", dir.name.to_string());
 			let mut entry = Self::dir_entry_as_bytes(dir.inode,dir.type_indicator,&dir.name.to_string());
 			target_data.append(&mut entry);
-			println!("target_data now goes up to {}", target_data.len());
+			//println!("target_data now goes up to {}", target_data.len());
 		}
 		let mut extra_space = self.block_size - target_data.len();
 		
 		
 		//get the entries from the last block and move to target block, unless target is last block
 		if target_block.1 != dir_blocks.len()-1 {
-			println!("doing stuff to the last block, aka index {}",dir_blocks.len()-1);
+			//println!("doing stuff to the last block, aka index {}",dir_blocks.len()-1);
 			let mut last_entries = Vec::new();
 			let entry_ptr = self.blocks[dir_blocks[dir_blocks.len()-1] as usize - self.block_offset].as_ptr();
 		    let mut byte_offset: isize = 0;
@@ -512,7 +512,7 @@ impl Ext2 {
 		    	};
 		    	//assemble list of dirs
 				last_entries.push(directory);
-				println!("found {} in the last block", directory.name.to_string());
+				//println!("found {} in the last block", directory.name.to_string());
 				//assume that the directory size was aligned properly to the block
 		        byte_offset += directory.entry_size as isize;
 		    }
@@ -526,10 +526,10 @@ impl Ext2 {
 					last_entry_size = ((entry[5] as u16) << 8) | entry[4] as u16;
 					extra_space -= last_entry_size as usize;
 					target_data.append(&mut entry);
-					println!("moved {} to earlier block", dir.name.to_string());
+					//println!("moved {} to earlier block", dir.name.to_string());
 				} else {
 					new_last_data.append(&mut entry);
-					println!("kept {} in last block", dir.name.to_string());
+					//println!("kept {} in last block", dir.name.to_string());
 				}
 			}
 			//size the last entry appropriately, if this isn't the last block
@@ -550,7 +550,7 @@ impl Ext2 {
 		
 		//write new directory contents to root, dealloc blocks if necessary
 		root.write_block(self, target_block.1, Some(&mut target_data))?;
-		println!("wrote to block {} of the inode",target_block.1);
+		//println!("wrote to block {} of the inode",target_block.1);
 		
 		//decrement hard_links counter for target
 		target.hard_links -= 1;
@@ -572,7 +572,7 @@ impl Ext2 {
 			        //assume that the directory size was aligned properly to the block
 					if child.inode as usize != root_inode && child.inode as usize != target_inode {
 						//don't recurse on those, just ignore them and "unlink" later by deallocing
-						println!("child is: {}, root is: {}, target is: {}", child.inode, root_inode,target_inode);
+						//println!("child is: {}, root is: {}, target is: {}", child.inode, root_inode,target_inode);
 						self.remove(target_inode,child.inode as usize, &child.name.to_string())?;
 					}
 			        byte_offset += child.entry_size as isize;
@@ -614,7 +614,7 @@ impl Ext2 {
 	            let directory = unsafe { 
 		        	&*(entry_ptr.offset(byte_offset) as *const DirectoryEntry) 
 		    	};
-		        println!("found {:?}", directory);
+		        //println!("found {:?}", directory);
 		        //assume that the directory size was aligned properly to the block
 				ret.push((directory.inode as usize, &directory.name));
 		        byte_offset += directory.entry_size as isize;
@@ -834,7 +834,7 @@ impl Inode {
 	//need to make everything consistent with behaviour on block boundaries.  Decide when to add new blocks, how to check for existing blocks
 	fn append_to_file(&mut self, bytes: &[u8], ext2: &mut Ext2) -> std::io::Result<usize> {
 		let mut file_size = self.file_size();//check file size at beginning
-		println!("file size is {} before appending", file_size);
+		//println!("file size is {} before appending", file_size);
 		
 		let mut next_block;
 		let mut byte_offset: usize = ext2.block_size - self.block_space_left(ext2);
@@ -846,12 +846,12 @@ impl Inode {
 			next_block = self.to_new_block(ext2)?;
 			byte_offset = 0;
 		}
-		println!("before");
-		for i in 0..ext2.blocks[next_block as usize - ext2.block_offset].len() {
-			print!("{} ",ext2.blocks[next_block as usize - ext2.block_offset][i]);
-		}
-		println!();
-		println!("appending to file on block: {}; space left to write is {}", next_block, self.block_space_left(ext2));
+//		println!("before");
+//		for i in 0..ext2.blocks[next_block as usize - ext2.block_offset].len() {
+//			print!("{} ",ext2.blocks[next_block as usize - ext2.block_offset][i]);
+//		}
+//		println!();
+		//println!("appending to file on block: {}; space left to write is {}", next_block, self.block_space_left(ext2));
 		let mut block_ptr = ext2.blocks[next_block as usize - ext2.block_offset].as_ptr();
 		let mut block_bytes = unsafe {
 			std::slice::from_raw_parts_mut(
@@ -863,7 +863,7 @@ impl Inode {
 		let mut bytes_written = 0;
 		
 		for byte in bytes {
-			println!("writing byte {} of block {}; there are {} bytes remaining", byte_offset, next_block,ext2.block_size-byte_offset);
+			//println!("writing byte {} of block {}; there are {} bytes remaining", byte_offset, next_block,ext2.block_size-byte_offset);
 			if byte_offset == 1024 {
 				next_block = self.to_new_block(ext2)?;
 				block_ptr = ext2.blocks[next_block as usize - ext2.block_offset].as_ptr();
@@ -875,7 +875,7 @@ impl Inode {
 				};
 				byte_offset = 0;
 			}
-			println!("continued appending on new block {} with offset {}; {} space left in this block",next_block,byte_offset,ext2.block_size-byte_offset);
+			//println!("continued appending on new block {} with offset {}; {} space left in this block",next_block,byte_offset,ext2.block_size-byte_offset);
 			block_bytes[byte_offset] = *byte;
 			byte_offset += 1;
 			bytes_written += 1;
@@ -884,18 +884,18 @@ impl Inode {
 			self.size_low = file_size as u32;
 			self.size_high = (file_size>>32) as u32;
 		}
-		println!("after");
-		for i in 0..ext2.blocks[next_block as usize - ext2.block_offset].len() {
-			print!("{} ",ext2.blocks[next_block as usize - ext2.block_offset][i]);
-		}
-		println!();
-		println!("file size is {} after appending, using {} blocks", file_size, self.get_all_blocks(ext2).len());
+//		println!("after");
+//		for i in 0..ext2.blocks[next_block as usize - ext2.block_offset].len() {
+//			print!("{} ",ext2.blocks[next_block as usize - ext2.block_offset][i]);
+//		}
+//		println!();
+		//println!("file size is {} after appending, using {} blocks", file_size, self.get_all_blocks(ext2).len());
 		Ok(bytes_written)
 	}
 	
 	fn write_block(&mut self, ext2: &mut Ext2, block_index: usize, new_data: Option<&mut [u8]>) -> std::io::Result<()> {
 		let mut file_size = self.file_size();
-		println!("the file size before writing: {}", file_size);
+		//println!("the file size before writing: {}", file_size);
 		if let Some(data) = new_data{
 			//if writing to the last block, should adjust file size
 			if block_index == (file_size as usize - 1)/ext2.block_size {
@@ -919,8 +919,8 @@ impl Inode {
 			for i in 0..data.len() {
 				ext2.blocks[block - ext2.block_offset][i] = data[i];
 			}
-			println!("the file size after writing: {}", file_size);
-			println!("we just wrote data of size {}", data.len());
+			//println!("the file size after writing: {}", file_size);
+			//println!("we just wrote data of size {}", data.len());
 //			println!("after");
 //			for i in 0..ext2.blocks[block].len() {
 //				print!("{} ",ext2.blocks[block - ext2.block_offset][i]);
@@ -937,7 +937,7 @@ impl Inode {
 			file_size -= ext2.block_size as u64;
 			self.size_low = file_size as u32;
 			self.size_high = (file_size>>32) as u32;
-			println!("the file size after deleting: {}", file_size);
+			//println!("the file size after deleting: {}", file_size);
 		}
 		Ok(())
 	}
@@ -1036,7 +1036,6 @@ fn main() -> Result<()> {
                 // `mkdir childname`
                 // create a directory with the given name, add a link to cwd
                 // TODO all commands with options should be robust against empty strings
-                //TODO: current bug: if root directory entry was moved, the child directories will get fucked, as will other dirs next to root
                 let elts: Vec<&str> = line.split(' ').collect();
                 if elts.len() == 1 {
      				println!("must supply an argument to mkdir")
@@ -1097,7 +1096,7 @@ fn main() -> Result<()> {
 					if target_inode != 0 {
 						let file_inode = ext2.get_inode(target_inode);
 						if file_inode.type_perm & TypePerm::FILE == TypePerm::FILE {
-							let file_size = (file_inode.size_low as u64) + (file_inode.size_high as u64)<<32;
+							let file_size = file_inode.file_size();
 							let blocks = file_inode.get_all_blocks(&ext2);
 							let mut size_left = file_size as usize;
 		                    for block_ptr in blocks {
@@ -1171,7 +1170,6 @@ fn main() -> Result<()> {
                 //think about different filesystem destination -- check!!
                 //just needs to link/unlink
                 //TODO can you move a directory?
-                //TODO really weird bug - mv hello -> other -> hello gets rid of it entirely.  Then mkdir new2 will redirect new/.?????
                 let elts: Vec<&str> = line.split(' ').collect();
                 if elts.len() < 3 {
      				println!("must supply two arguments to mv")
@@ -1225,8 +1223,55 @@ fn main() -> Result<()> {
             } else if line.starts_with("export") {
                 // `export filename host_target`
                 // writes filename out to the host system at host_target
-                //TODO: this
-                println!("export not yet implemented");
+                // relative host filenames are determined from the repository directory
+                let elts: Vec<&str> = line.split(' ').collect();
+                if elts.len() < 3 {
+     				println!("must supply two arguments to export")
+                } else {
+                    let filename = elts[1];
+                    let target_inode = match ext2.parse_path(current_working_inode, filename) {
+						Ok(inode) => inode,
+						Err(e) => {println!("{}", e);
+				                0}
+					};
+					if target_inode != 0 {
+						let file_inode = ext2.get_inode(target_inode);
+						if file_inode.type_perm & TypePerm::FILE == TypePerm::FILE {
+							let mut dest_file = File::create(format!("{}",elts[2]))?;
+							
+							let file_size = file_inode.file_size();
+							let blocks = file_inode.get_all_blocks(&ext2);
+							let mut size_left = file_size as usize;
+							let mut success = true;
+		                    for block_ptr in blocks {
+								if size_left > 0 {
+									let block_index = block_ptr as usize - ext2.block_offset;
+									if size_left < ext2.block_size {
+										if let Err(e) = dest_file.write_all(ext2.blocks[block_index].split_at(size_left).0){
+											println!("write failed on block {} with error {}", block_ptr, e);
+											success = false;
+											break;
+										}
+										size_left = 0;
+									} else{
+										if let Err(e) = dest_file.write_all(ext2.blocks[block_index]){
+											println!("write failed on block {} with error {}", block_ptr, e);
+											success = false;
+											break;
+										}
+										size_left -= ext2.blocks[block_index].len();
+									}
+								}
+							}
+							dest_file.flush()?;
+							if(success){
+								println!("export complete");
+							}
+	                	} else {
+							println!("unable to export, {} is not a file", filename);
+						}
+					}
+                }
             } else if line.starts_with("unmount") {
                 // `unmount`
                 // quits the filesystem and writes changes out to the device (file)
