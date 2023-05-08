@@ -9,7 +9,7 @@ use zerocopy::{ByteSliceMut, AsBytes};
 use std::fmt;
 use rustyline::{DefaultEditor, Result};
 use std::fs::File;//could try to read in fs with this
-use std::io::Write;
+use std::io::{Read, Write};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -518,7 +518,6 @@ impl Ext2 {
 		    }
 		    //now pull from here to fill in the remaining block size, then reconstruct last block
 		    //okay this for loop could definitely just go in the while loop above, but this might be nicer organizationally?
-		    let old_last_data = &self.blocks[dir_blocks[dir_blocks.len()-1] as usize];
 			let mut new_last_data: Vec<u8> = Vec::new();
 			for dir in last_entries {
 				let mut entry = Self::dir_entry_as_bytes(dir.inode,dir.type_indicator,&dir.name.to_string());
@@ -593,6 +592,46 @@ impl Ext2 {
 		Ok(())
 	}
 	
+	pub fn overwrite_file(&mut self, target_inode: usize, new_data: &mut Vec<u8>) -> std::io::Result<()>{
+		//have to do the same thing again here... there's probbly a way to refactor this away 
+		let target_group: usize = (target_inode - 1) / self.superblock.inodes_per_group as usize;
+        let target_index: usize = (target_inode - 1) % self.superblock.inodes_per_group as usize;
+        
+        let target_inode_table_block = (self.block_groups[target_group].inode_table_block) as usize - self.block_offset;
+        let target_inode_offset: isize = (target_index*std::mem::size_of::<Inode>()).try_into().unwrap();
+        let target_inode_location = self.blocks[target_inode_table_block].as_ptr();
+        // println!("in get_inode, block number of inode table {}", inode_table_block);
+        let target = unsafe {
+            &mut *(target_inode_location.offset(target_inode_offset) as *mut Inode)
+        };
+        
+		let existing_blocks = target.get_all_blocks(self);
+		let source_len = new_data.len();
+		let source_blocks = (source_len+self.block_size-1)/self.block_size;
+		//first truncate the file if necessary, so that the last block will adjust size properly
+		for i in source_blocks..existing_blocks.len() {
+			if let Err(e) = target.write_block(self, i, None){
+				println!("unable to complete write, encountered error {}", e);
+			}
+		}
+		//now write all of the blocks, appending when neccessary
+		for i in 0..source_blocks {
+			let start_of_block = i*self.block_size;
+			let end_of_block = if i < source_blocks-1 {start_of_block+self.block_size} else {new_data.len()};
+			if i < existing_blocks.len() {
+				if let Err(e) = target.write_block(self, i, Some(&mut new_data[start_of_block..end_of_block])) {
+					println!("failed import on block {} with error: {}", i, e);
+					break;
+				}
+			} else {
+				if let Err(e) = target.append_to_file(&mut new_data[start_of_block..end_of_block], self) {
+					println!("failed import on block {} with error: {}", i, e);
+					break;
+				}
+			}
+		}
+		Ok(())
+	}
 
     pub fn read_dir_inode(&self, inode: usize) -> std::io::Result<Vec<(usize, &NulStr)>> {
         let mut ret = Vec::new();
@@ -768,6 +807,7 @@ impl Inode {
 	}
 	
 	pub fn get_block(&self, n: usize, ext2: &Ext2) -> u32 {
+		//TODO: check against filesize
 		if n < 12 {
 			self.direct_pointer[n]
 		} else if n < 12 + ext2.block_size/4 {
@@ -1125,6 +1165,7 @@ fn main() -> Result<()> {
                 // unlink a file or empty directory
                 // `rm -r target` to recursively empty a directory
                 // get the target and check for -r
+                //TODO: don't remove cwd
                 let elts: Vec<&str> = line.split(' ').collect();
                 if elts.len() == 1 {
      				println!("must supply an argument to rm")
@@ -1218,8 +1259,58 @@ fn main() -> Result<()> {
             } else if line.starts_with("import") {
                 // `import host_file target_name`
                 // import a file from the host system as target_name
-                //TODO: this
-                println!("import not yet implemented");
+                let elts: Vec<&str> = line.split(' ').collect();
+                if elts.len() < 3 {
+     				println!("must supply two arguments to import")
+                } else {
+					//first find the tareget file (if it exists) or create a new one
+                    let filename = elts[2];
+                    let mut target_inode = match ext2.parse_path(current_working_inode, filename) {
+						Ok(inode) => inode,
+						Err(e) => 0,
+					};
+					//check that at least the parent exists, even if target doesn't
+					let dest_path_vec: Vec<&str> = filename.split('/').collect();
+					let dest_parent_path = dest_path_vec[..dest_path_vec.len()-1].join("/");
+					let parent_inode = match ext2.parse_path(current_working_inode, &dest_parent_path) {
+						Ok(inode) => inode,
+						Err(_) => {println!("{}", e);
+				                0}
+					};
+					while parent_inode != 0 {//TODO: find a better way to do this, it just feels nicer to use break if file doesn't exist
+						let Ok(mut source_file) = File::open(format!("{}",elts[1])) else {
+							println!("can't open file {}", elts[1]);
+							break;
+						};
+						
+						if target_inode == 0{
+							//file doesn't exist yet - create it
+							target_inode = match ext2.alloc_inode(){
+								Ok(inode) => inode,
+								Err(e) => {println!("unable to allocate new inode, encountered error {}", e);
+								break;},
+							};
+							//link, set size_high, and set type_perm
+							if let Err(e) = ext2.link(target_inode,parent_inode,dest_path_vec[dest_path_vec.len()-1]){
+								println!("unable to link new inode, encountered error: {}", e);
+							}
+							let target = ext2.get_mut_inode(target_inode);
+							target.type_perm = TypePerm::FILE;
+							target.size_high = 0;
+						}
+						
+						let mut read_data = vec![0;source_file.metadata()?.len() as usize];
+						if let Err(e) = source_file.read_to_end(&mut read_data) {
+							println!("unable to read {}, encountered error: {}", elts[1],e);
+						} else {
+							if let Err(e) = ext2.overwrite_file(target_inode,&mut read_data){
+								println!("{}", e);
+							}
+						}
+						
+						break;
+					}
+                }
             } else if line.starts_with("export") {
                 // `export filename host_target`
                 // writes filename out to the host system at host_target
@@ -1264,7 +1355,7 @@ fn main() -> Result<()> {
 								}
 							}
 							dest_file.flush()?;
-							if(success){
+							if success{
 								println!("export complete");
 							}
 	                	} else {
