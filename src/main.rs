@@ -895,19 +895,105 @@ impl Inode {
 	
 	/// Sets the `n`th data block of `self` to refer to the block address `block`.  Returns whether the
 	/// operation was successful, or what the error was.
-	pub fn set_block(&mut self, n: usize, block: u32, ext2: &Ext2) -> std::io::Result<()>{
+	pub fn set_block(&mut self, n: usize, block: u32, ext2: &mut Ext2) -> std::io::Result<()>{
 		//out of bounds
 		if n >= 12 + ext2.block_size/4 + ext2.block_size*ext2.block_size/16 + ext2.block_size*ext2.block_size*ext2.block_size/64 {
 			return Err(std::io::Error::new(std::io::ErrorKind::Other,"error block index out of bounds"));
 		}
+		//This function has to get all of the data itself, since we may need to modify the contents of ext2.
 		if n < 12 {
 			self.direct_pointer[n] = block;
 		} else if n < 12 + ext2.block_size/4 {
-			ext2.read_ptr_block(self.indirect_pointer)[n-12] = block;
+			if self.indirect_pointer < ext2.block_offset as u32 {
+				//set the indirect pointer
+				self.indirect_pointer = ext2.alloc_block()?;
+			}
+			//go to the pointer block and overwrite the right pointer
+			let entry_ptr = ext2.blocks[self.indirect_pointer as usize - ext2.block_offset].as_ptr();
+			let byte_offset: isize = ((n-12)*4) as isize;
+			let ptr = unsafe { 
+		        &mut *(entry_ptr.offset(byte_offset) as *mut u32)
+		    };
+		    *ptr = block;
+		    //check if we should dealloc this pointer block (if the block we just wrote was 0)
+		    if block == 0 && ext2.read_ptr_block(self.indirect_pointer).len() == 0{
+				ext2.dealloc_block(self.indirect_pointer as usize)?;
+				self.indirect_pointer = 0;
+			}
 		} else if n < 12 + ext2.block_size/4 + ext2.block_size*ext2.block_size/16 {
-			ext2.read_double_ptr_block(self.doubly_indirect)[n-12 - ext2.block_size/4] = block;
+			if self.doubly_indirect < ext2.block_offset as u32 {
+				//set the pointer
+				self.doubly_indirect = ext2.alloc_block()?;
+			}
+			let ptr_index = n-12 - ext2.block_size/4;
+			//go to the indirect pointer block and alloc pointer if necessary
+			let entry_ptr = ext2.blocks[self.doubly_indirect as usize - ext2.block_offset].as_ptr();
+			let byte_offset: isize = ((ptr_index/(ext2.block_size/4))*4) as isize;
+			let ind_ptr = unsafe { 
+		        &mut *(entry_ptr.offset(byte_offset) as *mut u32)
+		    };
+		    if *ind_ptr < ext2.block_offset as u32 {
+				*ind_ptr = ext2.alloc_block()?;
+			}
+			let entry_ptr_2 = ext2.blocks[*ind_ptr as usize - ext2.block_offset].as_ptr();
+			let byte_offset_2: isize = ((ptr_index%(ext2.block_size/4))*4) as isize;
+			let ptr = unsafe { 
+		        &mut *(entry_ptr_2.offset(byte_offset_2) as *mut u32)
+		    };
+		    *ptr = block;
+		    //check if pointer blocks should be deallocated
+		    if block == 0 && ext2.read_ptr_block(*ind_ptr).len() == 0{
+				ext2.dealloc_block(*ind_ptr as usize)?;
+				*ind_ptr = 0;
+				if ext2.read_ptr_block(self.doubly_indirect).len() == 0{
+					ext2.dealloc_block(self.doubly_indirect as usize)?;
+					self.doubly_indirect = 0;
+				}
+			}
 		} else {
-			ext2.read_triple_ptr_block(self.triply_indirect)[n-12 - ext2.block_size/4 - ext2.block_size*ext2.block_size/16] = block;
+			if self.triply_indirect < ext2.block_offset as u32 {
+				//set the pointer
+				self.triply_indirect = ext2.alloc_block()?;
+			}
+			let ptr_index = n-12 - ext2.block_size/4 - ext2.block_size*ext2.block_size/16;
+			//go to the indirect pointer block and alloc pointer if necessary
+			let entry_ptr = ext2.blocks[self.doubly_indirect as usize - ext2.block_offset].as_ptr();
+			let byte_offset: isize = ((ptr_index/(ext2.block_size*ext2.block_size/16))*4) as isize;
+			let ind_ind_ptr = unsafe { 
+		        &mut *(entry_ptr.offset(byte_offset) as *mut u32)
+		    };
+		    if *ind_ind_ptr < ext2.block_offset as u32 {
+				*ind_ind_ptr = ext2.alloc_block()?;
+			}
+			let entry_ptr_2 = ext2.blocks[*ind_ind_ptr as usize - ext2.block_offset].as_ptr();
+			//TODO: check math
+			let byte_offset_2: isize = (((ptr_index%(ext2.block_size*ext2.block_size/16))/(ext2.block_size/4))*4) as isize;
+			let ind_ptr = unsafe { 
+		        &mut *(entry_ptr_2.offset(byte_offset_2) as *mut u32)
+		    };
+		    if *ind_ptr < ext2.block_offset as u32 {
+				*ind_ptr = ext2.alloc_block()?;
+			}
+			let entry_ptr_3 = ext2.blocks[*ind_ptr as usize - ext2.block_offset].as_ptr();
+			//TODO: check math
+			let byte_offset_3: isize = ((ptr_index%(ext2.block_size/4))*4) as isize;
+			let ptr = unsafe { 
+		        &mut *(entry_ptr_3.offset(byte_offset_3) as *mut u32)
+		    };
+		    *ptr = block;
+		    //check if pointer blocks should be deallocated
+		    if block == 0 && ext2.read_ptr_block(*ind_ptr).len() == 0{
+				ext2.dealloc_block(*ind_ptr as usize)?;
+				*ind_ptr = 0;
+				if ext2.read_ptr_block(*ind_ind_ptr).len() == 0{
+					ext2.dealloc_block(*ind_ind_ptr as usize)?;
+					*ind_ind_ptr = 0;
+					if ext2.read_ptr_block(self.triply_indirect).len() == 0{
+						ext2.dealloc_block(self.triply_indirect as usize)?;
+						self.triply_indirect = 0;
+					}
+				}
+			}
 		}
 		Ok(())
 	}
@@ -952,7 +1038,6 @@ impl Inode {
 		Ok(next_block)
 	}
 	
-	//TODO: ADD POINTER BLOCKS, OOPS!
 	//need to make everything consistent with behaviour on block boundaries.  Decide when to add new blocks, how to check for existing blocks
 	/// Appends to the file [pointed to by `self`.  Can take a slice of any size, and allocates new blocks as
 	/// necessary.  Returns the number of bytes written in an `Ok`, or an `Err` with the problem encountered.
@@ -1021,6 +1106,7 @@ impl Inode {
 	/// If `new_data` is `None`, this will instead remove the block.  Writes data from the start of the
 	/// block, leaving alone any data that lies after the end of `new_data`.
 	fn write_block(&mut self, ext2: &mut Ext2, block_index: usize, new_data: Option<&mut [u8]>) -> std::io::Result<()> {
+		//TODO: check against current file size to make sure block is well defined
 		let mut file_size = self.file_size();
 		//println!("the file size before writing: {}", file_size);
 		if let Some(data) = new_data{
@@ -1057,9 +1143,11 @@ impl Inode {
 			//if None, dealloc the block
 			ext2.dealloc_block(self.get_block(block_index, ext2) as usize)?;
 			//then rearrange all the relevant pointers
-			for i in block_index..=((file_size as usize - 1)/ext2.block_size) {
+			for i in block_index..((file_size as usize - 1)/ext2.block_size) {
 				self.set_block(i, self.get_block(i+1, ext2), ext2)?;
 			}
+			//fix last one manually - should also dealloc any pointer blocks necessary
+			self.set_block((file_size as usize - 1)/ext2.block_size, 0, ext2)?;
 			//and set filesize
 			file_size -= ext2.block_size as u64;
 			self.size_low = file_size as u32;
