@@ -405,10 +405,9 @@ impl Ext2 {
 				}
 		    }
 			
-		    //now get a new block
-		    //all of these call get_mut_inode again because root these are mutable references to self being passed
+		    //now update the file size, but let append take us to a new block
 		    //println!("not enough space in last block of root");
-			root.to_new_block(self)?;
+			root.size_low += (self.block_size-dir_size_left) as u32;
 		}
 		
 		//write the directory entry to the file
@@ -459,8 +458,6 @@ impl Ext2 {
 	/// should be performed elsewhere.
 	pub fn remove(&mut self, root_inode: usize, target_inode: usize, target_name: &str) -> std::io::Result<()>{
 		//println!("removing {} at inode {} from dir {}",target_name,target_inode,root_inode);
-		//TODO fix endless loop? (try rm lost+found)
-		//TODO check name=inode
 		//this code just grabs the inode from self, as a mutable reference, without needing to keep
 		//around an extra mutable reference to self
 		let root_group: usize = (root_inode - 1) / self.superblock.inodes_per_group as usize;
@@ -696,6 +693,8 @@ impl Ext2 {
 		    	};
 		        //println!("found {:?}", directory);
 		        //assume that the directory size was aligned properly to the block
+		        //this is a temp fix for lost+found, not sure what's goind on with that but there's something bad
+		        if directory.entry_size == 0 {break;}
 				ret.push((directory.inode as usize, &directory.name));
 		        byte_offset += directory.entry_size as isize;
 		    }
@@ -770,8 +769,8 @@ impl Ext2 {
 	/// ```
 	pub fn dir_entry_as_bytes(inode: u32, type_ind: TypeIndicator, name: &str) -> Vec<u8> {
 		//TODO: 4-byte aligned entries
-		let name_len = (name.len()+1) as u8;
-		let entry_size = (name_len+8) as u16;
+		let name_len = name.len() as u8;
+		let entry_size = (name_len+9) as u16;
 		let mut bytes = Vec::<u8>::new();
 		//println!("entry size is {}, in bytes it's {} {}", entry_size, entry_size.to_le_bytes()[0],entry_size.to_le_bytes()[1]);
 		bytes.extend_from_slice(&inode.to_le_bytes());
@@ -786,6 +785,7 @@ impl Ext2 {
 	/// Parses the path given as `pathname`, starting from the inode `root_inode`, and returns the inode
 	/// that it refers to inside an `Ok`.  Returns an `Err` if it could not resolve the pathname for any reason.
 	pub fn parse_path(&self, root_inode: usize, pathname: &str) -> std::io::Result<usize> {
+		//println!("parsing path");
 		let last_name = match pathname.split('/').filter(|&x| !x.is_empty()).last() {
 			Some(name) => name,
 			None => ""
@@ -793,6 +793,7 @@ impl Ext2 {
         let path = pathname.split('/').filter(|&x| !x.is_empty());
         let mut parent_inode = root_inode;
        	for dir in path {
+			//println!("parsing {}",dir);
 			let mut found = false;
 			let children = match self.read_dir_inode(parent_inode) {
 				Ok(dir_listing) => dir_listing,
@@ -801,8 +802,10 @@ impl Ext2 {
 				}
 			};
 		    for child in &children {
+				//println!("parsing child {}", child.1);
 		    	if child.1.to_string().eq(dir){
 					if dir == last_name { //if this is the end of the path, return
+						//println!("found inode {}",child.0);
 						return Ok(child.0);
 					}
 					found = true;
@@ -819,6 +822,7 @@ impl Ext2 {
 		  		return Err(std::io::Error::new(std::io::ErrorKind::Other,format!("unable to locate {}", dir)));
 		   	}
 		}
+		//empty path, just return the start
 		return Ok(root_inode);
 	}
 }
@@ -1016,7 +1020,6 @@ impl Inode {
 	/// a new block.  This block should always be written to immediately to avoid losing track of the fact that it's allocated.
 	/// To ensure this, it is best to either call `write_to_block` on the new block, or let `append_to_file` call this.
 	fn to_new_block(&mut self, ext2: &mut Ext2) -> std::io::Result<u32> {
-		//TODO: check that mkdir doesn't double allocate by calling this when it shouldn't (would double call on next append)
 		//println!("inode only has {} space left",self.block_space_left(ext2));
 		let mut file_size;
 		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
@@ -1168,6 +1171,8 @@ impl Inode {
 	
 }
 
+//TODO fix endless loop? (try ls lost+found)
+
 fn main() -> Result<()> {
 	//TODO read from file?
     let mut disk = include_bytes!("../myfsplusbeemovie.ext2").to_vec();
@@ -1282,7 +1287,7 @@ fn main() -> Result<()> {
 						let root_dir = path_vec[..path_vec.len()-1].join("/");
 						let root_inode = match ext2.parse_path(current_working_inode, &root_dir) {
 							Ok(inode) => inode,
-							Err(e) => {println!("{}", e);
+							Err(e) => {println!("failed to resolve directory {}: {}", root_dir, e);
 					                0}
 						};
 						if root_inode != 0 {
@@ -1306,7 +1311,7 @@ fn main() -> Result<()> {
                     let filename = elts[1];
                     let target_inode = match ext2.parse_path(current_working_inode, filename) {
 						Ok(inode) => inode,
-						Err(e) => {println!("{}", e);
+						Err(e) => {println!("failed to resolve filename {}: {}",filename, e);
 				                0}
 					};
 					if target_inode != 0 {
@@ -1352,11 +1357,11 @@ fn main() -> Result<()> {
                     let parent_path = path_vec[..path_vec.len()-1].join("/");
                     let parent_inode_num = match ext2.parse_path(current_working_inode, &parent_path) {
 						Ok(inode) => inode,
-						Err(e) => {println!("unable to locate {}, encountered error: {}",parent_path,e);0}
+						Err(e) => {println!("unable to resolve filename {}: {}",parent_path,e);0}
 					};
 					let target_inode_num = match ext2.parse_path(current_working_inode, filename) {
 						Ok(inode) => inode,
-						Err(e) => {println!("unable to locate {}, encountered error: {}",filename,e);0}
+						Err(e) => {println!("unable to resolve filename {}: {}",filename,e);0}
 					};
                     if parent_inode_num != 0 && target_inode_num != 0 {
 	                    let target_inode = ext2.get_inode(target_inode_num);
@@ -1397,18 +1402,18 @@ fn main() -> Result<()> {
                     let link_path_vec: Vec<&str> = link_path.split('/').collect();
                     let source_inode = match ext2.parse_path(current_working_inode,source_path){
 						Ok(inode) => inode,
-						Err(e) => {println!("{}",e);0},
+						Err(e) => {println!("unable to resolve filename {}: {}",source_path,e);0},
 					};
 					let source_parent_path = source_path_vec[..source_path_vec.len()-1].join("/");
                     let source_parent = match ext2.parse_path(current_working_inode,&source_parent_path){
 						Ok(inode) => inode,
-						Err(e) => {println!("{}",e);0},
+						Err(e) => {println!("unable to resolve filename {}: {}",source_parent_path,e);0},
 					};
 					let source_name = source_path_vec[source_path_vec.len()-1];
                     let link_parent_path = link_path_vec[..link_path_vec.len()-1].join("/");
                     let link_parent = match ext2.parse_path(current_working_inode,&link_parent_path){
 						Ok(inode) => inode,
-						Err(e) => {println!("{}",e);0},
+						Err(e) => {println!("unable to resolve filename {}: {}",link_parent_path,e);0},
 					};
                     let link_name;
 					if link_path.ends_with('/') {
@@ -1498,7 +1503,7 @@ fn main() -> Result<()> {
                     let filename = elts[1];
                     let target_inode = match ext2.parse_path(current_working_inode, filename) {
 						Ok(inode) => inode,
-						Err(e) => {println!("{}", e);
+						Err(e) => {println!("unable to resolve filename {}: {}",filename, e);
 				                0}
 					};
 					if target_inode != 0 {
@@ -1592,12 +1597,12 @@ fn main() -> Result<()> {
                     let link_path_vec: Vec<&str> = link_path.split('/').collect();
                     let source_inode = match ext2.parse_path(current_working_inode,source_path){
 						Ok(inode) => inode,
-						Err(e) => {println!("{}",e);0},
+						Err(e) => {println!("unable to resolve filename {}: {}",source_path,e);0},
 					};
                     let link_parent_path = link_path_vec[..link_path_vec.len()-1].join("/");
                     let link_parent = match ext2.parse_path(current_working_inode,&link_parent_path){
 						Ok(inode) => inode,
-						Err(e) => {println!("{}",e);0},
+						Err(e) => {println!("unable to resolve filename {}: {}",link_parent_path,e);0},
 					};
                     let link_name;
 					if link_path.ends_with('/') {

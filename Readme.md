@@ -45,6 +45,10 @@ I neglected the creation of rigorous tests, so that would be a very reasonable n
 
 There are still some bugs I'm finding and working out - check back in a few days and there may be some updates to the repo.  I may also add code examples to the documentation
 
+##  Update 5/10
+
+Fixed a bug relating to pointer blocks - large files would have issues before because indirect pointer blocks were not accessed correctly by `set_block`.  Should be all good now, as `set_block` will alloc/dealloc pointer blocks as necessary.  Also lost+found appears a little broken, not sure what that's about but I hadn't been testing on it and it appears it reads as containing blank directory entries?
+
 ### Original readme:
 
 This is a starting point for parsing and navigating ext2 file systems.
