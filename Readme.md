@@ -1,6 +1,6 @@
-#Project Writeup
+# Project Writeup
 
-##Goals
+## Goals
 
 I set out to implement some of the possible improvements to the ext2 filesystem project we started earlier in the semester.  My original plan was to add
  - `cat` for large files
@@ -9,7 +9,7 @@ I set out to implement some of the possible improvements to the ext2 filesystem 
  - `unmount` to save the changes back to the filesystem
  
 
-##Implemented Extensions:
+## Implemented Extensions:
 
 In the end, I managed to implement quite a bit more than I planned, and encountered some interesting code artifacts along the way.  I will detail those in the following sections.  The current set of features I have implemented (beyond the original project) is
  - `cat <file_name>` for large files
@@ -27,7 +27,7 @@ Additionally, all "name" arguments can take a path to a file instead of needing 
 
 When implementing these extensions, I split the functions between the `Ext2` struct and the `inode` struct, as they made sense at the time.  This may have lead to some issues, but I don't know if they could have been prevented by using a different structure.  Most of the separation was driven by my sense of what made sense for the inode to do, which is mainly getting blocks from the inode and writing to the file it describes.  The full set of functions and their documentation can be found by running `cargo doc` and `cargo doc --open`.
 
-##Peculiarities and fixed bugs
+## Peculiarities and fixed bugs
 
 First, there was a bug in the original code hat i needed to fix - it adds extra blocks to the end of the filesystem equal to `block_offset`.  This is because it takes a slice equal to the number of total blocks in order to read the blocks into the `Ext2` struct during construction, but it already moved forward by `block_offset` blocks when reading the superblock and block group descriptors.  I found this bug when implementing `unmount` and my written file was exactly `3072` bytes longer than the original, with empty blocks at the end.  This bug is very simple to fix, and probably important to deal with since those last blocks would be out of bounds.
 
@@ -35,7 +35,7 @@ Most of my difficulties had to do with the borrow checker.  Specifically, I repe
 
 Another tricky bug I had to deal with, although possibly not worth mentioning for any reason other than to document its symptoms, was a bug in my bitmap math.  It was just a bug in the `dealloc` functions, where they were grabbing the wrong byte when flipping a bit.  This bug was very tricky to track down though, because the symptoms initially appeared bizarre.  Sometimes, removing a file would not result in any issues - because of how I was testing it, this appeared to be true for certain files (that had convenient inode numbers).  When other files were removed (and I now know that this was unintentionally freeing unrelated inodes), I could then create new directories only to find that directory entries within other directories were modified.  This in some cases resulted in recursive directories, so I was looking for bugs that would somehow edit those directory entries during `remove`.  In reality, what was happening was that the inode (and sometimes blocks) for the already existing directory was marked as free, and allocated to the new directory as well.  Then, in constructing the new directory, the data blocks were overwritten with new data, and it only happened to show up in the old inode because the inodes pointed to the same data blocks.  The moral of this story is really just that if directories are being modified by seemingly unrelated actions, it may be helpful to check that all of the inodes and data blocks are marked free or used as appropriate.
 
-##Potential Improvements
+## Potential Improvements
 
 There are a few things that could be considered potential improvements from the way I wrote this code.  First, changing which structs own which functions may help with the borrow checker difficulties, although I think the bigger solution would be to change the function signatures of `append_to_file` and `write_block` to require only the specific parts of the `Ext2` struct that they need to access, rather than taking a mutable reference to the full struct.
 
@@ -45,7 +45,7 @@ I neglected the creation of rigorous tests, so that would be a very reasonable n
 
 There are still some bugs I'm finding and working out - check back in a few days and there may be some updates to the repo.  I may also add code examples to the documentation
 
-###Original readme:
+### Original readme:
 
 This is a starting point for parsing and navigating ext2 file systems.
 `cargo run` will start a session that looks like a shell. All you can
