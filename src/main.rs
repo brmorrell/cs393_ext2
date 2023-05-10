@@ -113,6 +113,9 @@ impl Ext2 {
         &inode_table[index]
     }
     
+	/// Like `get_inode`, but returns a mutable reference to the inode.
+	/// Useful if you only plan to modify tyhe inode itself, and not
+	/// other data from self, while you hold on to the reference to the inode
     pub fn get_mut_inode(&self, inode: usize) -> &mut Inode {
         let group: usize = (inode - 1) / self.superblock.inodes_per_group as usize;
         let index: usize = (inode - 1) % self.superblock.inodes_per_group as usize;
@@ -133,7 +136,12 @@ impl Ext2 {
         &mut inode_table[index]
     }
     
-    //after calling this, need to add links to prevent fragmentation
+	/// Finds a free inode and marks it used, returning the (1-indexed) number
+	/// of the inode it found.  Returns an `Err` if there are no free inodes.
+	/// 
+	/// After calling this, the caller must add a link to this inode or call `dealloc_inode`
+	/// on it to prevent fragmentation.  The caller also needs to set the `size_high` field
+	/// of the inode if it is a file, since directories do not use it.
     fn alloc_inode(&mut self) -> std::io::Result<usize> {
 		let mut group_num = 0;
 		for block_group in self.block_groups.iter_mut(){
@@ -168,7 +176,11 @@ impl Ext2 {
 		Err(std::io::Error::new(std::io::ErrorKind::Other,"no free inodes"))
 	}
 	
-	 fn alloc_block(&mut self) -> std::io::Result<u32> {
+	/// Finds a free block and marks it as used, returning the address of the block in
+	/// an `Ok`.  Returns an `Err` if there are no free blocks to alllocate.  Should only
+	/// be called by the inode write methods, as every used data block should be pointed 
+	/// to by an inode.
+	fn alloc_block(&mut self) -> std::io::Result<u32> {
 		let mut group_num = 0;
 		for block_group in self.block_groups.iter_mut(){
 			if block_group.free_blocks_count > 0{
@@ -198,16 +210,14 @@ impl Ext2 {
 		Err(std::io::Error::new(std::io::ErrorKind::Other,"no free blocks"))
 	}
 	
+	/// Frees the specified inode, marking it and all of its data blocks as unused.  Will
+	/// return an `Err` if it was unable to complete any of these operations for some reason.
+	/// When calling this, make sure that there are no hard links to this inode and all children
+	/// of this inode are freed (if it's a directory, and if they do not have other hard links).
+	/// 
+	/// No changes are made to the data within the inode.
 	fn dealloc_inode(&mut self, inode_num: usize) -> std::io::Result<()> {
 		let is_dir = self.get_inode(inode_num).type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY;
-//		if is_dir {
-//			//decrement hard link counter for each child (should just be . and ..)
-//			let children = self.read_dir_inode(inode_num)?;
-//			for (child,_) in children {
-//				let mut child_inode = self.get_mut_inode(child);
-//				child_inode.hard_links -= 1;
-//			}
-//		}
 		let inode = self.get_mut_inode(inode_num);
 		//dealloc data blocks
 		for block in inode.get_all_blocks(self) {
@@ -236,6 +246,8 @@ impl Ext2 {
 		return Ok(());
 	}
 	
+	/// Frees the specified block, marking it as unused.  No changes are made to the data contained
+	/// within the block.  Returns an `Err` if this operation could not complete for some reason.
 	fn dealloc_block(&mut self, block: usize) -> std::io::Result<()> {
 		//update block group and superblock
 		let group_num: usize = block / self.superblock.blocks_per_group as usize;
@@ -256,6 +268,12 @@ impl Ext2 {
 		return Ok(());
 	}
 	
+	/// Creates a hard link to the inode `link_target` in the directory `link_dir`, with the name
+	/// `link_name`.  Returns an `Err` if it could not complete that, for example if the directory
+	/// has no space.
+	/// 
+	/// Does not currently check that `link_dir` is a directory, or that `link_target` is not a
+	/// directory, so the caller must perform those checks.
 	pub fn link(&mut self, link_target: usize, link_dir: usize, link_name: &str) -> std::io::Result<()> {
 		//println!("calling link from source {} to target dir {} with name {}", link_target, link_dir, link_name);
 		//need to get inodes here, as they may be in the same bock group and want to mutate self.blocks later
@@ -327,6 +345,13 @@ impl Ext2 {
 		Ok(())
 	}
     
+	/// Creates a new directory and adds it to the directory `root_inode`, and adds the
+	/// appropriate links including `.` and `..`.  Returns the index of the inode referring
+	/// to the new directory inside an `Ok`.  If the new directory could not be created,
+	/// returns an `Err` instead.
+	/// 
+	/// Does not currently chceck that `root_inode` is a diorectory, so the caller must
+	/// perform that check.
     pub fn add_dir(&mut self, root_inode: usize, name: &str) -> std::io::Result<usize>{
 		let new_inode = self.alloc_inode()?;
 		//not using link because I'm lazy and it's technically more work having to retrieve the inodes each of the three times
@@ -419,11 +444,23 @@ impl Ext2 {
 		Ok(new_inode)
 	}
 	
-	//removes target file or directory
-	//assumed to be recursive, so check for contents elsewhere
+	/// Unlinks the target from the root.  Requires the name in case there are multiple
+	/// links to the same destination within the same directory.  The name and inode must
+	/// match, and the target should be a direct child of the root.
+	/// 
+	/// If the target name and inode do not match, or if it otherwise can't find the target, it will
+	/// return an `Err`.  It will also return an `Err` if any of the write operations fail.
+	/// 
+	/// If the removed link is the last link to the target inode, it will call `dealloc_inode` on it to
+	/// free it.
+	/// 
+	/// If `target_inode` is a directory, this will recursively unlink and possibly free the contents
+	/// of the target (except for `.` and `..`).  If you wish to only clear empty directories, that check
+	/// should be performed elsewhere.
 	pub fn remove(&mut self, root_inode: usize, target_inode: usize, target_name: &str) -> std::io::Result<()>{
 		//println!("removing {} at inode {} from dir {}",target_name,target_inode,root_inode);
 		//TODO fix endless loop? (try rm lost+found)
+		//TODO check name=inode
 		//this code just grabs the inode from self, as a mutable reference, without needing to keep
 		//around an extra mutable reference to self
 		let root_group: usize = (root_inode - 1) / self.superblock.inodes_per_group as usize;
@@ -531,8 +568,8 @@ impl Ext2 {
 					//println!("kept {} in last block", dir.name.to_string());
 				}
 			}
-			//size the last entry appropriately, if this isn't the last block
-			if new_last_data.len() > 0 {
+			//size the last entry appropriately, if this isn't now the last block
+			if new_last_data.len() > 0 || target_block.1 != dir_blocks.len() - 2{
 				let padded_size = (last_entry_size as usize + self.block_size - target_data.len()) as u16;
 				let size_loc = target_data.len()-last_entry_size as usize+4;
 				target_data[size_loc] = padded_size.to_le_bytes()[0];
@@ -592,6 +629,10 @@ impl Ext2 {
 		Ok(())
 	}
 	
+	/// Deletes the contents of `target_inode`, and replaces them with `new_data`.  `new_data` can be any
+	/// valid length, and does not need to be block aligned.  This functio will perform the block-alignment
+	/// and delete any extra blocks that are now unneeded.  Returns an `Err` if any of the writes fail, and
+	/// immediately stops writing.
 	pub fn overwrite_file(&mut self, target_inode: usize, new_data: &mut Vec<u8>) -> std::io::Result<()>{
 		//have to do the same thing again here... there's probbly a way to refactor this away 
 		let target_group: usize = (target_inode - 1) / self.superblock.inodes_per_group as usize;
@@ -663,6 +704,8 @@ impl Ext2 {
         Ok(ret)
     }
     
+	/// Reads the data of the block at address `block` as a list of pointers to other blocks.  Returns the contents as a
+	/// `Vec<u32>`.  Always reads the entire block.
     pub fn read_ptr_block(&self, block: u32) -> Vec<u32> {
 		if (block as usize) < self.block_offset {return Vec::new();}
 		let mut blocks = Vec::new();
@@ -680,6 +723,9 @@ impl Ext2 {
 		blocks
 	}
 	
+	/// Reads the data of the block at address `block` as a block of indirect pointers.  Then follows
+	/// each of those pointers to retrieve a full list of data blocks included in the original doubly
+	/// indirect block.  Returns all of the pointers as a `Vec<u32>`
 	pub fn read_double_ptr_block(&self, block: u32) -> Vec<u32>{
 		if (block as usize) < self.block_offset {return Vec::new();}
 		let more_blocks = self.read_ptr_block(block);
@@ -690,6 +736,8 @@ impl Ext2 {
 		all_blocks
 	}
 	
+	/// Reads `block` as a triply indirect pointer, and follows it to find all of the data blocks it refers to.
+	/// Returns all of the pointers as a `Vec<u32>`.
 	pub fn read_triple_ptr_block(&self, block: u32) -> Vec<u32>{
 		if (block as usize) < self.block_offset {return Vec::new();}
 		let more_blocks = self.read_double_ptr_block(block);
@@ -700,6 +748,26 @@ impl Ext2 {
 		all_blocks
 	}
 	
+	/// Generates the byte representation of a `Directory_Entry` with the given inode, type_indicator,
+	/// and name.  Converts `name` to a `NulStr`, and calculates the appropriate sizes.  Returns an
+	/// owned `Vec<u8>`.
+	/// 
+	/// If the entry
+	/// needs padding, the size bytes should be modified by the caller, by modifying the bytes
+	/// 
+	/// ```
+	/// let mut entry = dir_entry_as_bytes(10,TypeIndicator::Regular,"ex_name");
+	/// let new_entry_size: u16 = 48;
+	/// entry[4] = entry_size.to_le_bytes()[0];
+	/// entry[5] = entry_size.to_le_bytes()[1];
+	/// ```
+	/// 
+	/// The size of the entry can be retrieved in the same way, using
+	/// 
+	/// ```
+	/// let entry = dir_entry_as_bytes(10,TypeIndicator::Regular,"ex_name");
+	/// let entry_size = ((entry[5] as u16) << 8) | entry[4] as u16;
+	/// ```
 	pub fn dir_entry_as_bytes(inode: u32, type_ind: TypeIndicator, name: &str) -> Vec<u8> {
 		//TODO: 4-byte aligned entries
 		let name_len = (name.len()+1) as u8;
@@ -715,6 +783,8 @@ impl Ext2 {
 		bytes
 	}
 	
+	/// Parses the path given as `pathname`, starting from the inode `root_inode`, and returns the inode
+	/// that it refers to inside an `Ok`.  Returns an `Err` if it could not resolve the pathname for any reason.
 	pub fn parse_path(&self, root_inode: usize, pathname: &str) -> std::io::Result<usize> {
 		let last_name = match pathname.split('/').filter(|&x| !x.is_empty()).last() {
 			Some(name) => name,
@@ -769,6 +839,8 @@ impl fmt::Debug for Inode<> {
 }
 
 impl Inode {
+	/// Gets all of the data blocks used by the `self`.  The returned `Vec<u32>` contains addresses usable by
+	/// the `Ext2` object this was called on.
 	pub fn get_all_blocks(&self, ext2: &Ext2) -> Vec<u32> {
 		let file_size = self.file_size();
 		let mut blocks = Vec::new();
@@ -796,9 +868,9 @@ impl Inode {
 		blocks
 	}
 	
+	/// Returns the amount of space left before a new block is needed.
 	pub fn block_space_left(&self,ext2: &Ext2) -> usize{
 		let file_size = self.file_size();
-		//add to the file size
 		if file_size as usize % ext2.block_size == 0 {
 			0
 		} else { 
@@ -806,6 +878,8 @@ impl Inode {
 		}
 	}
 	
+	/// Gets the `n`th block of the inode, indexing based on the order of the inode's data blocks,
+	///  rather than the `Ext2` block addresses.
 	pub fn get_block(&self, n: usize, ext2: &Ext2) -> u32 {
 		//TODO: check against filesize
 		if n < 12 {
@@ -819,6 +893,8 @@ impl Inode {
 		}
 	}
 	
+	/// Sets the `n`th data block of `self` to refer to the block address `block`.  Returns whether the
+	/// operation was successful, or what the error was.
 	pub fn set_block(&mut self, n: usize, block: u32, ext2: &Ext2) -> std::io::Result<()>{
 		//out of bounds
 		if n >= 12 + ext2.block_size/4 + ext2.block_size*ext2.block_size/16 + ext2.block_size*ext2.block_size*ext2.block_size/64 {
@@ -836,7 +912,8 @@ impl Inode {
 		Ok(())
 	}
 	
-	//gets the last allocated block, if it exists
+	/// Finds the last data block used by `self` and returns it.  Returns `None` if `self` does not
+	/// use any data blocks.
 	pub fn get_last_block(&self, ext2: &Ext2) -> Option<u32> {
 		let file_size = self.file_size();
 		if file_size == 0 {
@@ -849,7 +926,11 @@ impl Inode {
 		Some(self.get_block(num_blocks as usize,ext2))
 	}
 	
+	/// Forces `self` to move to a new block before continuing ot append.  This adds to the file size as needed, and allocates
+	/// a new block.  This block should always be written to immediately to avoid losing track of the fact that it's allocated.
+	/// To ensure this, it is best to either call `write_to_block` on the new block, or let `append_to_file` call this.
 	fn to_new_block(&mut self, ext2: &mut Ext2) -> std::io::Result<u32> {
+		//TODO: check that mkdir doesn't double allocate by calling this when it shouldn't (would double call on next append)
 		//println!("inode only has {} space left",self.block_space_left(ext2));
 		let mut file_size;
 		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
@@ -871,7 +952,10 @@ impl Inode {
 		Ok(next_block)
 	}
 	
+	//TODO: ADD POINTER BLOCKS, OOPS!
 	//need to make everything consistent with behaviour on block boundaries.  Decide when to add new blocks, how to check for existing blocks
+	/// Appends to the file [pointed to by `self`.  Can take a slice of any size, and allocates new blocks as
+	/// necessary.  Returns the number of bytes written in an `Ok`, or an `Err` with the problem encountered.
 	fn append_to_file(&mut self, bytes: &[u8], ext2: &mut Ext2) -> std::io::Result<usize> {
 		let mut file_size = self.file_size();//check file size at beginning
 		//println!("file size is {} before appending", file_size);
@@ -933,6 +1017,9 @@ impl Inode {
 		Ok(bytes_written)
 	}
 	
+	/// Writes to the `block_index`th data block used by this inode, overwriting the contents with `new_data`.
+	/// If `new_data` is `None`, this will instead remove the block.  Writes data from the start of the
+	/// block, leaving alone any data that lies after the end of `new_data`.
 	fn write_block(&mut self, ext2: &mut Ext2, block_index: usize, new_data: Option<&mut [u8]>) -> std::io::Result<()> {
 		let mut file_size = self.file_size();
 		//println!("the file size before writing: {}", file_size);
@@ -982,6 +1069,7 @@ impl Inode {
 		Ok(())
 	}
 	
+	/// Returns the size of the file, checking if it's a directory (directories only use `size_low`)
 	pub fn file_size(&self) -> u64 {
 		if self.type_perm & TypePerm::DIRECTORY == TypePerm::DIRECTORY {
 			self.size_low as u64
@@ -1267,14 +1355,14 @@ fn main() -> Result<()> {
                     let filename = elts[2];
                     let mut target_inode = match ext2.parse_path(current_working_inode, filename) {
 						Ok(inode) => inode,
-						Err(e) => 0,
+						Err(_) => 0,
 					};
 					//check that at least the parent exists, even if target doesn't
 					let dest_path_vec: Vec<&str> = filename.split('/').collect();
 					let dest_parent_path = dest_path_vec[..dest_path_vec.len()-1].join("/");
 					let parent_inode = match ext2.parse_path(current_working_inode, &dest_parent_path) {
 						Ok(inode) => inode,
-						Err(_) => {println!("{}", e);
+						Err(e) => {println!("{}", e);
 				                0}
 					};
 					while parent_inode != 0 {//TODO: find a better way to do this, it just feels nicer to use break if file doesn't exist
