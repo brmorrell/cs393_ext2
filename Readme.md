@@ -49,6 +49,14 @@ There are still some bugs I'm finding and working out - check back in a few days
 
 Fixed a bug relating to pointer blocks - large files would have issues before because indirect pointer blocks were not accessed correctly by `set_block`.  Should be all good now, as `set_block` will alloc/dealloc pointer blocks as necessary.  Also lost+found appears a little broken, not sure what that's about but I hadn't been testing on it and it appears it reads as containing blank directory entries?
 
+## Update 5/11
+
+The filesystem now reads in data at runtime, so that you don't need to recompile after every edit.  The file that is read in is passed as a command line argument, and `./myfsplusbeemovie.ext2` will give the file system I have been using to test.  This also sets the file written to by `unmount`.
+
+Also fixed `lost+found` - it appears my block allocation code was a bit buggy before, and the old version of the `myfsplusbeemovie.ext2` file had a link to `new` within the `lost+found` directory as a result of double allocation of a block.  The `lost+found` directory for some reason is also 12 blocks long, and the `new` directory entry had overwritten the last of these blocks with the wrong size, so it tried to read a blank directory entry after reading the entry for `new`.  I repaired the file, which involved removing `new` from the root directory so I could just manually remove the directory entry and then fix the root inode and bitmaps to prevent the issue from reoccurring.  I believe I have eliminated the underlying issue based on my subsequent tests.
+
+I've left in the temporary measures I took, namely excluding links to inode 0 from the output of ls and it now immediately stops reading if it sees an entry of size 0 (to prevent infinite loops).  I also used the chance to test my new indirect pointer allocation on `lost+found` (since it already uses all of the direct pointers), which appeared to work properly.
+
 ### Original readme:
 
 This is a starting point for parsing and navigating ext2 file systems.

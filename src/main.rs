@@ -10,6 +10,7 @@ use std::fmt;
 use rustyline::{DefaultEditor, Result};
 use std::fs::File;//could try to read in fs with this
 use std::io::{Read, Write};
+use std::env;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -167,6 +168,7 @@ impl Ext2 {
 				let inode = self.get_mut_inode(new_inode_num);
 				inode.gid = group_num.try_into().unwrap();
 				inode.size_low = 0;
+				inode.hard_links = 0; //just in case
 				//size high must be modified by caller, in case its a directory
 				//println!("allocated new inode with index {}",new_inode_num);
 				return Ok(new_inode_num);
@@ -675,11 +677,12 @@ impl Ext2 {
         let mut ret = Vec::new();
         let root = self.get_inode(inode);
         //println!("in read_dir_inode, #{} : {:?}", inode, root);
+        //println!("the inode's size is: {}", root.file_size());
         let dir_size = root.size_low;
 		let dir_blocks = root.get_all_blocks(&self);
         let mut blocks_read = 0;
         for block in dir_blocks {
-//			println!("readng block {} of the directory", blocks_read);
+			//println!("readng block {} of the directory", blocks_read);
 //			for i in 0..self.blocks[block as usize].len() {
 //				print!("{} ",self.blocks[block as usize - self.block_offset][i]);
 //			}
@@ -693,9 +696,13 @@ impl Ext2 {
 		    	};
 		        //println!("found {:?}", directory);
 		        //assume that the directory size was aligned properly to the block
-		        //this is a temp fix for lost+found, not sure what's goind on with that but there's something bad
+		        //this is a temp fix for lost+found, not sure what's going on with that but there's something bad
+		        //actually probably a good idea to keep around, to prevent infinite loops
+		        //but the thing before was that lost+found was broken in the actual data
 		        if directory.entry_size == 0 {break;}
-				ret.push((directory.inode as usize, &directory.name));
+		        if directory.inode != 0 {//convenient to exclude nonsense
+					ret.push((directory.inode as usize, &directory.name));
+				}
 		        byte_offset += directory.entry_size as isize;
 		    }
 		    blocks_read += 1;
@@ -835,6 +842,7 @@ impl fmt::Debug for Inode<> {
             f.debug_struct("Inode")
             .field("type_perm", &self.type_perm)
             .field("size_low", &self.size_low)
+            .field("hard_links", &self.hard_links)
             .field("direct_pointers", &self.direct_pointer)
             .field("indirect_pointer", &self.indirect_pointer)
             .finish()
@@ -1175,7 +1183,12 @@ impl Inode {
 
 fn main() -> Result<()> {
 	//TODO read from file?
-    let mut disk = include_bytes!("../myfsplusbeemovie.ext2").to_vec();
+	let args: Vec<String> = env::args().collect();
+	if args.len() < 2 {return Ok(());}
+	let mut disk_source = File::open(format!("{}",args[1]))?; //use ./myfsplusbeemovie.ext2
+	let mut disk = Vec::new();
+	disk_source.read_to_end(&mut disk)?;
+    //let mut disk = include_bytes!("../myfsplusbeemovie.ext2").to_vec();
     let start_addr: usize = disk.as_mut_ptr() as usize;
     let mut ext2 = Ext2::new(&mut disk[..], start_addr);
 
@@ -1548,7 +1561,7 @@ fn main() -> Result<()> {
                 // `unmount`
                 // quits the filesystem and writes changes out to the device (file)
                 //TODO: should this wait until every block is done to actually write them, somehow?
-                let mut device_out = File::create("./myfsplusbeemovie.ext2")?;
+                let mut device_out = File::create(format!("{}",args[1]))?;
                 let boot_block = disk.split_at(EXT2_START_OF_SUPERBLOCK).0;
                 if let Err(e) = device_out.write_all(boot_block) {
 						println!("write failed on boot block with error {}", e);
